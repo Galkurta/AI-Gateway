@@ -2,12 +2,80 @@ import type {
   ProviderAdapter, ProviderConfig, NormalizedRequest,
   NormalizedResponse, StreamChunk, ModelInfo, ChatMessage
 } from '../types.js';
+import { refreshOAuthToken } from '../oauth-refresh.js';
 
 const DEFAULT_BASE = 'https://api.anthropic.com';
 const API_VERSION = '2023-06-01';
+const CLAUDE_OAUTH_BETA_FLAGS = [
+  'claude-code-20250219',
+  'oauth-2025-04-20',
+  'interleaved-thinking-2025-05-14',
+  'context-management-2025-06-27',
+  'prompt-caching-scope-2026-01-05',
+  'advanced-tool-use-2025-11-20',
+  'effort-2025-11-24',
+  'structured-outputs-2025-12-15',
+  'fast-mode-2026-02-01',
+  'redact-thinking-2026-02-12',
+  'token-efficient-tools-2026-03-28',
+];
 
 function normalizeBase(url: string): string {
   return url.replace(/\/v\d+\/?$/, '').replace(/\/$/, '');
+}
+
+function mapStainlessOs(): string {
+  switch (process.platform) {
+    case 'darwin': return 'MacOS';
+    case 'win32': return 'Windows';
+    case 'linux': return 'Linux';
+    case 'freebsd': return 'FreeBSD';
+    default: return `Other::${process.platform}`;
+  }
+}
+
+function mapStainlessArch(): string {
+  switch (process.arch) {
+    case 'x64': return 'x64';
+    case 'arm64': return 'arm64';
+    case 'ia32': return 'x86';
+    default: return `other::${process.arch}`;
+  }
+}
+
+function mergeBetaFlags(...values: Array<string | undefined>): string {
+  const flags = new Set<string>();
+  for (const value of values) {
+    for (const flag of (value ?? '').split(',')) {
+      const clean = flag.trim();
+      if (clean) flags.add(clean);
+    }
+  }
+  return Array.from(flags).join(',');
+}
+
+function claudeOauthHeaders(extraHeaders: Record<string, string>): Record<string, string> {
+  const beta = mergeBetaFlags(
+    CLAUDE_OAUTH_BETA_FLAGS.join(','),
+    extraHeaders['anthropic-beta'],
+    extraHeaders['Anthropic-Beta'],
+  );
+  delete extraHeaders['Anthropic-Beta'];
+  return {
+    'anthropic-beta': beta,
+    'anthropic-dangerous-direct-browser-access': extraHeaders['anthropic-dangerous-direct-browser-access'] ?? 'true',
+    'User-Agent': extraHeaders['User-Agent'] ?? extraHeaders['user-agent'] ?? 'claude-cli/2.1.92 (external, sdk-cli)',
+    'X-App': extraHeaders['X-App'] ?? extraHeaders['x-app'] ?? 'cli',
+    'X-Stainless-Helper-Method': extraHeaders['X-Stainless-Helper-Method'] ?? extraHeaders['x-stainless-helper-method'] ?? 'stream',
+    'X-Stainless-Retry-Count': extraHeaders['X-Stainless-Retry-Count'] ?? extraHeaders['x-stainless-retry-count'] ?? '0',
+    'X-Stainless-Runtime-Version': extraHeaders['X-Stainless-Runtime-Version'] ?? extraHeaders['x-stainless-runtime-version'] ?? `v${process.versions.node}`,
+    'X-Stainless-Package-Version': extraHeaders['X-Stainless-Package-Version'] ?? extraHeaders['x-stainless-package-version'] ?? '0.80.0',
+    'X-Stainless-Runtime': extraHeaders['X-Stainless-Runtime'] ?? extraHeaders['x-stainless-runtime'] ?? 'node',
+    'X-Stainless-Lang': extraHeaders['X-Stainless-Lang'] ?? extraHeaders['x-stainless-lang'] ?? 'js',
+    'X-Stainless-Arch': extraHeaders['X-Stainless-Arch'] ?? extraHeaders['x-stainless-arch'] ?? mapStainlessArch(),
+    'X-Stainless-Os': extraHeaders['X-Stainless-Os'] ?? extraHeaders['x-stainless-os'] ?? mapStainlessOs(),
+    'X-Stainless-Timeout': extraHeaders['X-Stainless-Timeout'] ?? extraHeaders['x-stainless-timeout'] ?? '600',
+  };
 }
 
 function buildHeaders(config: ProviderConfig): Record<string, string> {
@@ -15,6 +83,10 @@ function buildHeaders(config: ProviderConfig): Record<string, string> {
   const authScheme = extraHeaders['X-Gateway-Auth-Scheme'] ?? extraHeaders['x-gateway-auth-scheme'];
   delete extraHeaders['X-Gateway-Auth-Scheme'];
   delete extraHeaders['x-gateway-auth-scheme'];
+  const base = normalizeBase(config.baseUrl ?? DEFAULT_BASE);
+  const oauthHeaders = authScheme === 'bearer' && base.includes('api.anthropic.com')
+    ? claudeOauthHeaders(extraHeaders)
+    : {};
 
   return {
     'Content-Type': 'application/json',
@@ -22,8 +94,20 @@ function buildHeaders(config: ProviderConfig): Record<string, string> {
     ...(authScheme === 'bearer'
       ? { Authorization: `Bearer ${config.apiKey ?? ''}` }
       : { 'x-api-key': config.apiKey ?? '' }),
+    ...oauthHeaders,
     ...extraHeaders,
   };
+}
+
+async function fetchWithAuthRetry(config: ProviderConfig, url: string, init: RequestInit = {}): Promise<Response> {
+  await refreshOAuthToken(config);
+  let res = await fetch(url, { ...init, headers: buildHeaders(config) });
+  if (res.status === 401 || res.status === 403) {
+    await res.body?.cancel().catch(() => {});
+    await refreshOAuthToken(config, true);
+    res = await fetch(url, { ...init, headers: buildHeaders(config) });
+  }
+  return res;
 }
 
 function toAnthropicMessages(messages: ChatMessage[]): { system?: string; messages: object[] } {
@@ -55,7 +139,7 @@ export const AnthropicAdapter: ProviderAdapter = {
 
   async listModels(config) {
     const base = normalizeBase(config.baseUrl ?? DEFAULT_BASE);
-    const res = await fetch(`${base}/v1/models`, { headers: buildHeaders(config) });
+    const res = await fetchWithAuthRetry(config, `${base}/v1/models`);
     if (!res.ok) {
       const text = await res.text().catch(() => res.statusText);
       throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
@@ -82,9 +166,8 @@ export const AnthropicAdapter: ProviderAdapter = {
     if (req.top_p !== undefined) body.top_p = req.top_p;
     if (req.stop) body.stop_sequences = Array.isArray(req.stop) ? req.stop : [req.stop];
 
-    const res = await fetch(`${base}/v1/messages`, {
+    const res = await fetchWithAuthRetry(config, `${base}/v1/messages`, {
       method: 'POST',
-      headers: buildHeaders(config),
       body: JSON.stringify(body),
     });
 
@@ -123,9 +206,8 @@ export const AnthropicAdapter: ProviderAdapter = {
     if (req.top_p !== undefined) body.top_p = req.top_p;
     if (req.stop) body.stop_sequences = Array.isArray(req.stop) ? req.stop : [req.stop];
 
-    const res = await fetch(`${base}/v1/messages`, {
+    const res = await fetchWithAuthRetry(config, `${base}/v1/messages`, {
       method: 'POST',
-      headers: buildHeaders(config),
       body: JSON.stringify(body),
     });
 

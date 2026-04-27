@@ -446,7 +446,7 @@ function decodeJwtPayload(jwt: string): Record<string, unknown> | undefined {
   }
 }
 
-function upsertIflowProvider(apiKey: string, email?: string, targetProviderId?: string): string {
+function upsertIflowProvider(apiKey: string, email?: string, targetProviderId?: string, oauth?: { accessToken?: string; refreshToken?: string; expiresIn?: number }): string {
   const account = email ?? `iflow-${apiKey.slice(0, 12)}`;
   const now = Date.now();
   const name = providerStoredName('iflow', account);
@@ -455,6 +455,10 @@ function upsertIflowProvider(apiKey: string, email?: string, targetProviderId?: 
   const cookiesObject = {
     oauth_provider: 'iflow',
     oauth_account: account,
+    access_token: oauth?.accessToken,
+    oauth_access_token: oauth?.accessToken,
+    refresh_token: oauth?.refreshToken,
+    access_token_expires_at: oauth?.expiresIn ? String(now + oauth.expiresIn * 1000) : undefined,
     connected_at: new Date(now).toISOString(),
   };
   if (upsertOAuthAccount({
@@ -516,7 +520,7 @@ function qwenHeaders(): Record<string, string> {
   };
 }
 
-function upsertQwenProvider(accessToken: string, refreshToken?: string, resourceUrl?: string, targetProviderId?: string): string {
+function upsertQwenProvider(accessToken: string, refreshToken?: string, resourceUrl?: string, targetProviderId?: string, expiresIn?: number): string {
   const baseUrl = qwenBaseUrl(resourceUrl);
   const now = Date.now();
   const account = `qwen-${resourceUrl ?? refreshToken?.slice(0, 12) ?? accessToken.slice(0, 12)}`;
@@ -525,8 +529,12 @@ function upsertQwenProvider(accessToken: string, refreshToken?: string, resource
   const cookiesObject = {
     oauth_provider: 'qwen',
     oauth_account: account,
+    access_token: accessToken,
+    oauth_access_token: accessToken,
     qwen_refresh_token: refreshToken,
+    refresh_token: refreshToken,
     qwen_resource_url: resourceUrl,
+    access_token_expires_at: expiresIn ? String(now + expiresIn * 1000) : undefined,
     qwen_connected_at: new Date(now).toISOString(),
   };
   const extraHeadersObject = qwenHeaders();
@@ -609,6 +617,7 @@ function upsertOAuthAccount(options: {
   account: string;
   accessToken: string;
   refreshToken?: string;
+  expiresIn?: number;
   extraHeaders?: Record<string, string>;
   cookies?: Record<string, unknown>;
 }): boolean {
@@ -621,7 +630,10 @@ function upsertOAuthAccount(options: {
     ...(options.cookies ?? {}),
     oauth_provider: options.provider,
     oauth_account: options.account,
+    access_token: options.cookies?.access_token ?? options.accessToken,
+    oauth_access_token: options.cookies?.oauth_access_token ?? options.cookies?.access_token ?? options.accessToken,
     refresh_token: options.refreshToken,
+    access_token_expires_at: options.expiresIn ? String(now + options.expiresIn * 1000) : undefined,
     connected_at: new Date(now).toISOString(),
   });
   const extraHeaders = JSON.stringify(options.extraHeaders ?? {});
@@ -649,6 +661,7 @@ function upsertBearerProvider(options: {
   baseUrl: string;
   accessToken: string;
   refreshToken?: string;
+  expiresIn?: number;
   email?: string;
   notes: string;
   extraHeaders?: Record<string, string>;
@@ -662,6 +675,7 @@ function upsertBearerProvider(options: {
     account: accountName,
     accessToken: options.accessToken,
     refreshToken: options.refreshToken,
+    expiresIn: options.expiresIn,
     extraHeaders: options.extraHeaders,
     cookies: options.cookies,
   })) {
@@ -675,7 +689,10 @@ function upsertBearerProvider(options: {
     ...(options.cookies ?? {}),
     oauth_provider: options.provider,
     oauth_account: account,
+    access_token: options.accessToken,
+    oauth_access_token: options.accessToken,
     refresh_token: options.refreshToken,
+    access_token_expires_at: options.expiresIn ? String(now + options.expiresIn * 1000) : undefined,
     connected_at: new Date(now).toISOString(),
   });
   const extraHeaders = JSON.stringify(options.extraHeaders ?? {});
@@ -898,6 +915,7 @@ async function pollQwenToken(session: Extract<OAuthStatus, { status: 'pending' }
       typeof json.refresh_token === 'string' ? json.refresh_token : undefined,
       typeof json.resource_url === 'string' ? json.resource_url : undefined,
       session.targetProviderId,
+      typeof json.expires_in === 'number' ? json.expires_in : undefined,
     );
     return { status: 'complete', provider: 'qwen', createdAt: session.createdAt, providerId };
   }
@@ -940,7 +958,7 @@ async function pollGenericDeviceProvider(session: Extract<OAuthStatus, { status:
 
     const copilotRes = await fetch('https://api.github.com/copilot_internal/v2/token', {
       headers: {
-        Authorization: `Bearer ${json.access_token}`,
+        Authorization: `token ${json.access_token}`,
         Accept: 'application/json',
         'X-GitHub-Api-Version': '2022-11-28',
         'User-Agent': 'GitHubCopilotChat/0.26.7',
@@ -965,6 +983,7 @@ async function pollGenericDeviceProvider(session: Extract<OAuthStatus, { status:
       type: 'openai-compatible',
       baseUrl: 'https://api.githubcopilot.com/chat/completions',
       accessToken: copilot.token,
+      expiresIn: typeof json.expires_in === 'number' ? json.expires_in : undefined,
       email: login,
       notes: login ? `Connected via GitHub Copilot OAuth (${login})` : 'Connected via GitHub Copilot OAuth',
       extraHeaders: {
@@ -979,6 +998,8 @@ async function pollGenericDeviceProvider(session: Extract<OAuthStatus, { status:
       },
       cookies: {
         github_access_token: json.access_token,
+        refresh_token: typeof json.refresh_token === 'string' ? json.refresh_token : undefined,
+        github_access_token_expires_at: typeof json.expires_in === 'number' ? String(Date.now() + json.expires_in * 1000) : undefined,
         copilot_token_expires_at: copilot.expires_at,
       },
     });
@@ -1013,6 +1034,7 @@ async function pollGenericDeviceProvider(session: Extract<OAuthStatus, { status:
       baseUrl: 'https://api.kimi.com/coding',
       accessToken: json.access_token,
       refreshToken: kimiRefreshToken,
+      expiresIn: typeof json.expires_in === 'number' ? json.expires_in : undefined,
       notes: 'Connected via Kimi Coding device OAuth',
       extraHeaders: { 'X-Gateway-Auth-Scheme': 'bearer' },
       cookies: { oauth_account: `kimi-${String(kimiRefreshToken ?? json.access_token).slice(0, 12)}` },
@@ -1081,6 +1103,7 @@ async function pollGenericDeviceProvider(session: Extract<OAuthStatus, { status:
       baseUrl: 'https://copilot.tencent.com/v1',
       accessToken: data.accessToken,
       refreshToken: codebuddyRefreshToken,
+      expiresIn: 86400,
       notes: 'Connected via CodeBuddy OAuth',
       cookies: { oauth_account: `codebuddy-${String(codebuddyRefreshToken ?? data.accessToken).slice(0, 12)}` },
     });
@@ -1118,6 +1141,7 @@ async function pollGenericDeviceProvider(session: Extract<OAuthStatus, { status:
       baseUrl: 'https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse',
       accessToken: String(json.accessToken),
       refreshToken: typeof json.refreshToken === 'string' ? json.refreshToken : undefined,
+      expiresIn: typeof json.expiresIn === 'number' ? json.expiresIn : undefined,
       notes: `Connected via Kiro device OAuth (${account})`,
       cookies: {
         oauth_account: account,
@@ -1373,7 +1397,7 @@ async function handleIflowCallback(req: Request, res: ExpressResponse): Promise<
     const redirectUri = session.redirectUri ?? localCallbackUri(req);
     const tokens = await exchangeIflowCode(code, redirectUri);
     const user = await getIflowUserInfo(tokens.accessToken);
-    const providerId = upsertIflowProvider(user.apiKey, user.email, session.targetProviderId);
+    const providerId = upsertIflowProvider(user.apiKey, user.email, session.targetProviderId, tokens);
     oauthSessions.set(state, { status: 'complete', provider: 'iflow', createdAt, providerId, email: user.email });
 
     res.type('html').send('<!doctype html><html><body><script>window.close()</script><p>iFlow connected. You can close this tab.</p></body></html>');
@@ -1409,10 +1433,23 @@ async function handleClaudeCallback(req: Request, res: ExpressResponse): Promise
       baseUrl: 'https://api.anthropic.com',
       accessToken: tokens.accessToken,
       refreshToken: tokens.refreshToken,
+      expiresIn: tokens.expiresIn,
       notes: 'Connected via Claude Code OAuth',
       extraHeaders: {
         'X-Gateway-Auth-Scheme': 'bearer',
-        'anthropic-beta': 'oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14',
+        'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28',
+        'anthropic-dangerous-direct-browser-access': 'true',
+        'User-Agent': 'claude-cli/2.1.92 (external, sdk-cli)',
+        'X-App': 'cli',
+        'X-Stainless-Helper-Method': 'stream',
+        'X-Stainless-Retry-Count': '0',
+        'X-Stainless-Runtime-Version': `v${process.versions.node}`,
+        'X-Stainless-Package-Version': '0.80.0',
+        'X-Stainless-Runtime': 'node',
+        'X-Stainless-Lang': 'js',
+        'X-Stainless-Arch': process.arch === 'ia32' ? 'x86' : process.arch,
+        'X-Stainless-Os': process.platform === 'win32' ? 'Windows' : process.platform === 'darwin' ? 'MacOS' : process.platform === 'linux' ? 'Linux' : `Other::${process.platform}`,
+        'X-Stainless-Timeout': '600',
       },
       cookies: { oauth_account: account, expires_in: tokens.expiresIn, scope: tokens.scope },
     });
@@ -1450,6 +1487,7 @@ async function handleClineCallback(req: Request, res: ExpressResponse): Promise<
       baseUrl: 'https://api.cline.bot/api/v1',
       accessToken: tokens.accessToken,
       refreshToken: tokens.refreshToken,
+      expiresIn: tokens.expiresIn,
       email: account,
       notes: `Connected via Cline OAuth (${account})`,
       extraHeaders: {
@@ -1491,6 +1529,7 @@ async function handleGoogleCallback(provider: 'gemini-cli' | 'antigravity', req:
       baseUrl: provider === 'antigravity' ? 'https://daily-cloudcode-pa.googleapis.com' : 'https://cloudcode-pa.googleapis.com/v1internal',
       accessToken: tokens.accessToken,
       refreshToken: tokens.refreshToken,
+      expiresIn: tokens.expiresIn,
       email: account,
       notes: `Connected via ${provider === 'antigravity' ? 'Antigravity' : 'Gemini CLI'} OAuth (${account})`,
       cookies: { project_id: tokens.projectId, expires_in: tokens.expiresIn },
@@ -1528,6 +1567,7 @@ async function handleCodexCallback(req: Request, res: ExpressResponse): Promise<
       baseUrl: 'https://chatgpt.com/backend-api/codex/responses',
       accessToken: tokens.accessToken,
       refreshToken: tokens.refreshToken,
+      expiresIn: tokens.expiresIn,
       email: account,
       notes: `Connected via Codex OAuth (${account})`,
       cookies: { id_token: tokens.idToken, expires_in: tokens.expiresIn },
@@ -1564,6 +1604,7 @@ async function handleGitlabCallback(req: Request, res: ExpressResponse): Promise
       baseUrl: `${GITLAB_BASE_URL.replace(/\/$/, '')}/api/v4/chat/completions`,
       accessToken: tokens.accessToken,
       refreshToken: tokens.refreshToken,
+      expiresIn: tokens.expiresIn,
       email: account,
       notes: `Connected via GitLab OAuth (${account})`,
       cookies: { expires_in: tokens.expiresIn },

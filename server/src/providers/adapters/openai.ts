@@ -3,8 +3,17 @@ import type {
   NormalizedResponse, StreamChunk, ModelInfo
 } from '../types.js';
 import { classifyModelCapability } from '../capabilities.js';
+import { db } from '../../db/index.js';
+import { refreshOAuthToken } from '../oauth-refresh.js';
 
 const DEFAULT_BASE = 'https://api.openai.com';
+const GITHUB_COPILOT = {
+  CLIENT_ID: 'Iv1.b507a08c87ecfe98',
+  VSCODE_VERSION: '1.110.0',
+  COPILOT_CHAT_VERSION: '0.38.0',
+  USER_AGENT: 'GitHubCopilotChat/0.38.0',
+  API_VERSION: '2025-04-01',
+};
 
 function normalizeBase(url: string): string {
   return url.replace(/\/$/, '');
@@ -40,6 +49,134 @@ export function buildOpenAIHeaders(config: ProviderConfig): Record<string, strin
   };
 }
 
+function isGithubCopilot(config: ProviderConfig): boolean {
+  return !!(
+    config.baseUrl?.toLowerCase().includes('api.githubcopilot.com') ||
+    config.cookies?.oauth_provider === 'github'
+  );
+}
+
+function expiresSoon(value: string | undefined): boolean {
+  if (!value) return true;
+  const timestamp = /^\d+$/.test(value)
+    ? (Number(value) > 10_000_000_000 ? Number(value) : Number(value) * 1000)
+    : new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return true;
+  return timestamp - Date.now() < 5 * 60 * 1000;
+}
+
+async function refreshGitHubCopilotToken(config: ProviderConfig, force = false): Promise<void> {
+  if (!isGithubCopilot(config)) return;
+  if (!force && config.apiKey && !expiresSoon(config.cookies?.copilot_token_expires_at)) return;
+
+  let githubAccessToken = config.cookies?.github_access_token;
+  const githubRefreshToken = config.cookies?.refresh_token || config.cookies?.github_refresh_token;
+  let cookies = { ...(config.cookies ?? {}) };
+  if (!githubAccessToken && githubRefreshToken) {
+    const refreshed = await refreshGitHubOAuthToken(githubRefreshToken);
+    if (refreshed?.accessToken) {
+      githubAccessToken = refreshed.accessToken;
+      cookies = {
+        ...cookies,
+        github_access_token: refreshed.accessToken,
+        ...(refreshed.refreshToken ? { refresh_token: refreshed.refreshToken } : {}),
+        ...(refreshed.expiresIn ? { github_access_token_expires_at: String(Date.now() + refreshed.expiresIn * 1000) } : {}),
+      };
+    }
+  }
+  if (!githubAccessToken) return;
+
+  const res = await fetch('https://api.github.com/copilot_internal/v2/token', {
+    headers: {
+      Authorization: `token ${githubAccessToken}`,
+      'User-Agent': GITHUB_COPILOT.USER_AGENT,
+      'Editor-Version': `vscode/${GITHUB_COPILOT.VSCODE_VERSION}`,
+      'Editor-Plugin-Version': `copilot-chat/${GITHUB_COPILOT.COPILOT_CHAT_VERSION}`,
+      Accept: 'application/json',
+      'x-github-api-version': GITHUB_COPILOT.API_VERSION,
+    },
+  });
+  if (!res.ok) return;
+  const data = await res.json() as { token?: string; expires_at?: string };
+  if (!data.token && githubRefreshToken) {
+    const refreshed = await refreshGitHubOAuthToken(githubRefreshToken);
+    if (refreshed?.accessToken && refreshed.accessToken !== githubAccessToken) {
+      cookies = {
+        ...cookies,
+        github_access_token: refreshed.accessToken,
+        ...(refreshed.refreshToken ? { refresh_token: refreshed.refreshToken } : {}),
+        ...(refreshed.expiresIn ? { github_access_token_expires_at: String(Date.now() + refreshed.expiresIn * 1000) } : {}),
+      };
+      const retry = await fetch('https://api.github.com/copilot_internal/v2/token', {
+        headers: {
+          Authorization: `token ${refreshed.accessToken}`,
+          'User-Agent': GITHUB_COPILOT.USER_AGENT,
+          'Editor-Version': `vscode/${GITHUB_COPILOT.VSCODE_VERSION}`,
+          'Editor-Plugin-Version': `copilot-chat/${GITHUB_COPILOT.COPILOT_CHAT_VERSION}`,
+          Accept: 'application/json',
+          'x-github-api-version': GITHUB_COPILOT.API_VERSION,
+        },
+      });
+      if (!retry.ok) return;
+      const retryData = await retry.json() as { token?: string; expires_at?: string };
+      data.token = retryData.token;
+      data.expires_at = retryData.expires_at;
+    }
+  }
+  if (!data.token) return;
+
+  config.apiKey = data.token;
+  cookies = {
+    ...cookies,
+    ...(data.expires_at ? { copilot_token_expires_at: data.expires_at } : {}),
+  };
+  config.cookies = cookies;
+
+  if (config.accountId) {
+    db.prepare('UPDATE provider_accounts SET api_key = ?, cookies = ?, updated_at = ? WHERE id = ?')
+      .run(data.token, JSON.stringify(cookies), Date.now(), config.accountId);
+  } else {
+    db.prepare('UPDATE providers SET api_key = ?, cookies = ?, updated_at = ? WHERE id = ?')
+      .run(data.token, JSON.stringify(cookies), Date.now(), config.id);
+  }
+}
+
+async function prepareOAuth(config: ProviderConfig, force = false): Promise<void> {
+  await refreshOAuthToken(config, force);
+  await refreshGitHubCopilotToken(config, force);
+}
+
+async function fetchWithAuthRetry(config: ProviderConfig, url: string, init: RequestInit): Promise<Response> {
+  await prepareOAuth(config);
+  let res = await fetch(url, { ...init, headers: buildOpenAIHeaders(config) });
+  if (res.status === 401 || res.status === 403) {
+    await res.body?.cancel().catch(() => {});
+    await prepareOAuth(config, true);
+    res = await fetch(url, { ...init, headers: buildOpenAIHeaders(config) });
+  }
+  return res;
+}
+
+async function refreshGitHubOAuthToken(refreshToken: string): Promise<{ accessToken?: string; refreshToken?: string; expiresIn?: number } | null> {
+  const res = await fetch('https://github.com/login/oauth/access_token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+      client_id: GITHUB_COPILOT.CLIENT_ID,
+    }),
+  });
+  if (!res.ok) return null;
+  const json = await res.json() as { access_token?: string; refresh_token?: string; expires_in?: number };
+  if (!json.access_token) return null;
+  return {
+    accessToken: json.access_token,
+    refreshToken: json.refresh_token || refreshToken,
+    expiresIn: json.expires_in,
+  };
+}
+
 export function supportsOpenAIJsonEndpoint(config: ProviderConfig): boolean {
   return ['openai', 'openai-compatible', 'ollama', 'gitlab'].includes(config.type);
 }
@@ -50,7 +187,7 @@ export async function postOpenAIJson(config: ProviderConfig, path: string, body:
   data: unknown;
   text: string;
 }> {
-  const res = await fetch(openAIEndpoint(config.baseUrl, path), {
+  const res = await fetchWithAuthRetry(config, openAIEndpoint(config.baseUrl, path), {
     method: 'POST',
     headers: buildOpenAIHeaders(config),
     body: JSON.stringify(body),
@@ -72,7 +209,7 @@ export async function postOpenAIBinary(config: ProviderConfig, path: string, bod
   data: Buffer;
   text: string;
 }> {
-  const res = await fetch(openAIEndpoint(config.baseUrl, path), {
+  const res = await fetchWithAuthRetry(config, openAIEndpoint(config.baseUrl, path), {
     method: 'POST',
     headers: buildOpenAIHeaders(config),
     body: JSON.stringify(body),
@@ -105,7 +242,7 @@ export const OpenAIAdapter: ProviderAdapter = {
   async listModels(config) {
     const base = normalizeBase(config.baseUrl ?? DEFAULT_BASE);
     const url = endpoint(base, 'models');
-    const res = await fetch(url, { headers: buildOpenAIHeaders(config) });
+    const res = await fetchWithAuthRetry(config, url, { headers: buildOpenAIHeaders(config) });
     const contentType = res.headers.get('content-type') ?? '';
     const text = await res.text().catch(() => res.statusText);
     if (!res.ok) {
@@ -140,7 +277,7 @@ export const OpenAIAdapter: ProviderAdapter = {
     if (req.top_p !== undefined) body.top_p = req.top_p;
     if (req.stop) body.stop = req.stop;
 
-    const res = await fetch(endpoint(base, 'chat/completions'), {
+    const res = await fetchWithAuthRetry(config, endpoint(base, 'chat/completions'), {
       method: 'POST',
       headers: buildOpenAIHeaders(config),
       body: JSON.stringify(body),
@@ -180,7 +317,7 @@ export const OpenAIAdapter: ProviderAdapter = {
     if (req.top_p !== undefined) body.top_p = req.top_p;
     if (req.stop) body.stop = req.stop;
 
-    const res = await fetch(endpoint(base, 'chat/completions'), {
+    const res = await fetchWithAuthRetry(config, endpoint(base, 'chat/completions'), {
       method: 'POST',
       headers: buildOpenAIHeaders(config),
       body: JSON.stringify(body),

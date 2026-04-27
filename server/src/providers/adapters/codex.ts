@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { ChatMessage, ModelInfo, NormalizedRequest, ProviderAdapter, ProviderConfig } from '../types.js';
+import { refreshOAuthToken } from '../oauth-refresh.js';
 
 const CODEX_MODELS: ModelInfo[] = [
   { id: 'gpt-5.3-codex', name: 'GPT 5.3 Codex', owned_by: 'openai' },
@@ -24,6 +25,37 @@ function toResponsesInput(messages: ChatMessage[]): object[] {
 
 function bearer(config: ProviderConfig): string {
   return config.apiKey ?? config.cookies?.access_token ?? config.cookies?.oauth_access_token ?? '';
+}
+
+function buildHeaders(config: ProviderConfig): Record<string, string> {
+  return {
+    'Content-Type': 'application/json',
+    Accept: 'text/event-stream',
+    Authorization: `Bearer ${bearer(config)}`,
+    originator: 'codex-cli',
+    'User-Agent': 'codex-cli/1.0.18',
+    session_id: config.id,
+    ...config.extraHeaders,
+  };
+}
+
+async function fetchWithAuthRetry(config: ProviderConfig, url: string, body: object): Promise<Response> {
+  await refreshOAuthToken(config);
+  let res = await fetch(url, {
+    method: 'POST',
+    headers: buildHeaders(config),
+    body: JSON.stringify(body),
+  });
+  if (res.status === 401 || res.status === 403) {
+    await res.body?.cancel().catch(() => {});
+    await refreshOAuthToken(config, true);
+    res = await fetch(url, {
+      method: 'POST',
+      headers: buildHeaders(config),
+      body: JSON.stringify(body),
+    });
+  }
+  return res;
 }
 
 function stripEffort(model: string): { model: string; effort: string } {
@@ -68,19 +100,7 @@ export const CodexAdapter: ProviderAdapter = {
       include: effort !== 'none' ? ['reasoning.encrypted_content'] : undefined,
       instructions: 'You are Codex, a concise coding assistant.',
     };
-    const res = await fetch(base, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'text/event-stream',
-        Authorization: `Bearer ${bearer(config)}`,
-        originator: 'codex-cli',
-        'User-Agent': 'codex-cli/1.0.18',
-        session_id: config.id,
-        ...config.extraHeaders,
-      },
-      body: JSON.stringify(body),
-    });
+    const res = await fetchWithAuthRetry(config, base, body);
     const text = await res.text();
     if (!res.ok) throw new Error(`Codex error ${res.status}: ${text.slice(0, 500)}`);
     return {

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { ChatMessage, ModelInfo, NormalizedRequest, ProviderAdapter, ProviderConfig } from '../types.js';
+import { refreshOAuthToken } from '../oauth-refresh.js';
 
 const GEMINI_MODELS: ModelInfo[] = [
   { id: 'gemini-3-pro', name: 'Gemini 3 Pro', owned_by: 'google' },
@@ -47,6 +48,35 @@ function cookies(config: ProviderConfig): Record<string, string> {
 
 function bearer(config: ProviderConfig): string {
   return config.apiKey ?? cookies(config).access_token ?? cookies(config).oauth_access_token ?? '';
+}
+
+function buildHeaders(config: ProviderConfig, antigravity: boolean): Record<string, string> {
+  return {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${bearer(config)}`,
+    'User-Agent': antigravity ? 'antigravity/1.107.0' : 'gemini-cli/0.12.0',
+    ...(antigravity ? { 'x-request-source': 'local' } : { 'X-Goog-Api-Client': 'gl-node/22.0.0' }),
+    ...config.extraHeaders,
+  };
+}
+
+async function fetchWithAuthRetry(config: ProviderConfig, url: string, antigravity: boolean, body: object): Promise<Response> {
+  await refreshOAuthToken(config);
+  let res = await fetch(url, {
+    method: 'POST',
+    headers: buildHeaders(config, antigravity),
+    body: JSON.stringify(body),
+  });
+  if (res.status === 401 || res.status === 403) {
+    await res.body?.cancel().catch(() => {});
+    await refreshOAuthToken(config, true);
+    res = await fetch(url, {
+      method: 'POST',
+      headers: buildHeaders(config, antigravity),
+      body: JSON.stringify(body),
+    });
+  }
+  return res;
 }
 
 function projectId(config: ProviderConfig): string {
@@ -107,17 +137,7 @@ function makeAdapter(kind: 'gemini-cli' | 'antigravity'): ProviderAdapter {
     async complete(config, req) {
       const base = (config.baseUrl ?? defaultBase).replace(/\/$/, '');
       const url = antigravity ? `${base}/v1internal:generateContent` : `${base}:generateContent`;
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${bearer(config)}`,
-          'User-Agent': antigravity ? 'antigravity/1.107.0' : 'gemini-cli/0.12.0',
-          ...(antigravity ? { 'x-request-source': 'local' } : { 'X-Goog-Api-Client': 'gl-node/22.0.0' }),
-          ...config.extraHeaders,
-        },
-        body: JSON.stringify(buildBody(config, req, antigravity, false)),
-      });
+      const res = await fetchWithAuthRetry(config, url, antigravity, buildBody(config, req, antigravity, false));
       const text = await res.text();
       if (!res.ok) throw new Error(`${kind} error ${res.status}: ${text.slice(0, 500)}`);
       const data = JSON.parse(text) as Record<string, unknown>;
