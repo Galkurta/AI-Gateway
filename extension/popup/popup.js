@@ -2,6 +2,8 @@
   let currentTab = null;
   let providers = [];
   let providerAccounts = {};
+  let perplexityLastModel = null;
+  let perplexityLastMode = null;
   const WEB_COOKIE_TYPES = new Set(['claude-web', 'chatgpt-web', 'bud-web', 'devin-web', 'perplexity-web', 'zenmux-web']);
 
   const $ = id => document.getElementById(id);
@@ -99,6 +101,12 @@
       const btnLabel = sameDomain ? 'Extract from current tab' : 'Extract &amp; Push';
       const accounts = providerAccounts[p.id] || [];
 
+      const perplexityHint = p.type === 'perplexity-web'
+        ? (perplexityLastModel
+            ? `<div class="provider-url" title="Last model detected from perplexity.ai">🔍 Detected: <code>${esc(perplexityLastModel)}</code> (mode: ${esc(perplexityLastMode || '?')})</div>`
+            : `<div class="provider-url" style="opacity:0.5">No model detected yet — use Perplexity in your browser first.</div>`)
+        : '';
+
       return `<div class="provider-card">
         <div class="provider-head">
           <span class="provider-name">${esc(p.name)}</span>
@@ -106,6 +114,7 @@
           ${sameDomain ? '<span class="badge badge-green">Active tab</span>' : ''}
         </div>
         ${p.base_url ? `<div class="provider-url">${esc(p.base_url)}</div>` : ''}
+        ${perplexityHint}
         <div class="account-row">
           <select class="account-select" data-id="${p.id}">
             <option value="__auto__">Auto account</option>
@@ -205,8 +214,14 @@
   }
 
   // ── Boot ─────────────────────────────────────────────────────────────────────
+  async function loadPerplexityDetected() {
+    const data = await chrome.storage.local.get(['perplexityLastModel', 'perplexityLastMode']);
+    perplexityLastModel = data.perplexityLastModel || null;
+    perplexityLastMode = data.perplexityLastMode || null;
+  }
+
   async function init() {
-    await Promise.all([loadSettings(), loadAutoExtract()]);
+    await Promise.all([loadSettings(), loadAutoExtract(), loadPerplexityDetected()]);
     checkGateway();
 
     chrome.runtime.sendMessage({ type: 'GET_CURRENT_TAB' }, res => {

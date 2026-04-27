@@ -231,7 +231,7 @@ function autoDetectProvider(model: string): ReturnType<typeof resolveProvider> {
   // claude-sonnet-4-6 is intentionally NOT in this list — it's a real Anthropic model too.
   const BUD_EXCLUSIVE = new Set(['auto', 'claude-opus-4.6', 'gpt-5.5', 'gpt-5.4', 'gpt-5.3-codex']);
   const isBudWeb = BUD_EXCLUSIVE.has(model);
-  const isPerplexityWeb = model === 'perplexity-auto' || model.startsWith('sonar');
+  const isPerplexityWeb = model === 'perplexity-auto' || model.startsWith('sonar') || model.startsWith('perplexity-');
   const isAnthropic = model.startsWith('claude');
   const isOpenAI = model.startsWith('gpt') || model.startsWith('o1') || model.startsWith('o3') || model.startsWith('o4');
   const isXAI = model.startsWith('grok');

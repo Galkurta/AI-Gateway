@@ -604,6 +604,22 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
 
+  if (msg.type === 'PERPLEXITY_MODEL_DETECTED') {
+    if (msg.model_preference) {
+      chrome.storage.local.set({
+        perplexityLastModel: msg.model_preference,
+        perplexityLastMode: msg.mode || 'concise',
+      });
+    }
+    return false;
+  }
+
+  if (msg.type === 'GET_PERPLEXITY_LAST_MODEL') {
+    chrome.storage.local.get(['perplexityLastModel', 'perplexityLastMode'])
+      .then(data => sendResponse({ model_preference: data.perplexityLastModel || null, mode: data.perplexityLastMode || null }));
+    return true;
+  }
+
   if (msg.type === 'CHECK_GATEWAY') {
     const { gatewayUrl } = msg;
     const url = (gatewayUrl || 'http://localhost:3000').replace(/\/$/, '');
