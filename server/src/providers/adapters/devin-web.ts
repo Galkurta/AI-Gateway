@@ -6,6 +6,7 @@ import type {
   ProviderAdapter,
   ProviderConfig,
 } from '../types.js';
+import { refreshOAuthToken } from '../oauth-refresh.js';
 
 const BASE_URL = 'https://app.devin.ai';
 
@@ -228,11 +229,18 @@ async function createSession(config: ProviderConfig, req: NormalizedRequest): Pr
     },
   };
 
-  const res = await fetch(`${baseUrl(config)}/api/sessions`, {
+  let res = await fetch(`${baseUrl(config)}/api/sessions`, {
     method: 'POST',
     headers: headers(config),
     body: JSON.stringify(body),
   });
+  if (res.status === 401 && await refreshOAuthToken(config, true).catch(() => false)) {
+    res = await fetch(`${baseUrl(config)}/api/sessions`, {
+      method: 'POST',
+      headers: headers(config),
+      body: JSON.stringify(body),
+    });
+  }
   const json = await readJson(res);
   if (res.status === 401) {
     const hasBearer = !!findBearer(config);
@@ -285,9 +293,14 @@ async function fetchSession(config: ProviderConfig, orgId: string, devinId: stri
   const userId = setting(config, 'UserId');
   if (userId) params.set('creators', userId);
 
-  const res = await fetch(`${baseUrl(config)}/api/${encodeURIComponent(orgId)}/v2sessions?${params}`, {
+  let res = await fetch(`${baseUrl(config)}/api/${encodeURIComponent(orgId)}/v2sessions?${params}`, {
     headers: headers(config),
   });
+  if (res.status === 401 && await refreshOAuthToken(config, true).catch(() => false)) {
+    res = await fetch(`${baseUrl(config)}/api/${encodeURIComponent(orgId)}/v2sessions?${params}`, {
+      headers: headers(config),
+    });
+  }
   const json = await readJson(res);
   if (res.status === 401) {
     const source = devinTokenSource(config) ?? 'unknown';
@@ -320,7 +333,10 @@ async function waitForMessage(config: ProviderConfig, orgId: string, devinId: st
 }
 
 async function runDevin(config: ProviderConfig, req: NormalizedRequest): Promise<{ content: string; devinId: string }> {
-  if (!cookieHeader(config)) throw new Error('Devin Web requires cookies from a logged-in app.devin.ai session.');
+  await refreshOAuthToken(config).catch(() => false);
+  if (!cookieHeader(config) && !findBearer(config)) {
+    throw new Error('Devin Web requires cookies or a bearer token from a logged-in app.devin.ai session.');
+  }
   const startedAt = Date.now();
   const devinId = await createSession(config, req);
   const orgId = await resolveOrgId(config, devinId);

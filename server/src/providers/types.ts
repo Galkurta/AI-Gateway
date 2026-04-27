@@ -8,6 +8,7 @@ export type ProviderType =
   | 'bud-web'
   | 'devin-web'
   | 'perplexity-web'
+  | 'zenmux-web'
   | 'gemini-cli'
   | 'antigravity'
   | 'codex'
@@ -110,6 +111,11 @@ export interface ModelInfo {
   context_length?: number;
   owned_by?: string;
   created?: number;
+  billing?: 'free' | 'premium' | 'unknown';
+  pricing_summary?: string;
+  input_modalities?: string[];
+  output_modalities?: string[];
+  features?: string[];
   source_id?: string;
   alias_of?: string;
   forked_alias?: boolean;

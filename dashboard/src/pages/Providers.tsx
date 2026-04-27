@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Plus, Trash2, Edit2, ToggleLeft, ToggleRight, Upload, RefreshCw, KeyRound, LogIn, Cookie, HardDrive, Users } from 'lucide-react';
-import { api, type OAuthProvider, type Provider, type ProviderAccount } from '../lib/api';
+import { api, type Provider, type ProviderAccount } from '../lib/api';
 import { PROVIDER_PRESETS, type ProviderPreset } from '../lib/providerPresets';
 
 // ── Type display ──────────────────────────────────────────────────────────────
@@ -14,6 +14,7 @@ const TYPE_META: Record<string, { label: string; color: string }> = {
   'chatgpt-web':         { label: 'ChatGPT Web',      color: 'badge-yellow' },
   'bud-web':             { label: 'Bud Web',          color: 'badge-yellow' },
   'devin-web':           { label: 'Devin Web',        color: 'badge-yellow' },
+  'zenmux-web':          { label: 'ZenMux Web',       color: 'badge-yellow' },
   'gemini-cli':          { label: 'Gemini CLI',       color: 'badge-blue'   },
   'antigravity':         { label: 'Antigravity',      color: 'badge-blue'   },
   'codex':               { label: 'Codex',            color: 'badge-green'  },
@@ -22,6 +23,12 @@ const TYPE_META: Record<string, { label: string; color: string }> = {
   'gitlab':              { label: 'GitLab Duo',       color: 'badge-yellow' },
   'ollama':              { label: 'Ollama',            color: 'badge-gray'   },
 };
+
+const WEB_LOGIN_TYPES = new Set(['claude-web', 'chatgpt-web', 'bud-web', 'devin-web', 'perplexity-web', 'zenmux-web']);
+
+function isWebLoginProvider(provider: Pick<Provider, 'type'>): boolean {
+  return WEB_LOGIN_TYPES.has(provider.type);
+}
 
 /** Infer provider type from base URL — used for display & backend hint */
 function detectType(url: string): string {
@@ -32,6 +39,7 @@ function detectType(url: string): string {
   if (u.includes('bud.app'))           return 'bud-web';
   if (u.includes('app.devin.ai'))      return 'devin-web';
   if (u.includes('perplexity.ai') && !u.includes('api.perplexity.ai')) return 'perplexity-web';
+  if (u.includes('zenmux.ai') && !u.includes('/api/')) return 'zenmux-web';
   if (u.includes('claude.ai'))         return 'claude-web';
   if (u.includes('chatgpt.com') || u.includes('chat.openai.com')) return 'chatgpt-web';
   if (u.includes('api.openai.com'))    return 'openai';
@@ -69,7 +77,7 @@ type AccountFormData = {
 const FLOW_META: Record<ProviderFlow, { label: string; hint: string; icon: typeof KeyRound }> = {
   'api-key': { label: 'API Key', hint: 'Standard API providers', icon: KeyRound },
   oauth: { label: 'OAuth Login', hint: 'Browser or device-code login', icon: LogIn },
-  'web-cookie': { label: 'Web Cookie', hint: 'Website adapters with cookies', icon: Cookie },
+  'web-cookie': { label: 'Web Login', hint: 'Website login + session import', icon: Cookie },
   local: { label: 'Local', hint: 'Local runtime providers', icon: HardDrive },
 };
 
@@ -135,7 +143,7 @@ export default function ProvidersPage() {
   }
 
   const detectedType = form.provider_type || detectType(form.base_url);
-  const isCookieBased = detectedType === 'claude-web' || detectedType === 'chatgpt-web' || detectedType === 'bud-web' || detectedType === 'devin-web' || detectedType === 'perplexity-web';
+  const isCookieBased = WEB_LOGIN_TYPES.has(detectedType);
   const selectedPreset = PROVIDER_PRESETS.find(p => p.id === selectedPresetId);
   const isOAuthPreset = !!selectedPreset?.oauth;
   const flowPresets = PROVIDER_PRESETS.filter(p => (p.flow ?? 'api-key') === selectedFlow);
@@ -385,10 +393,10 @@ export default function ProvidersPage() {
     } catch (e) { setCookieMsg(`Error: ${String(e)}`); }
   }
 
-  const webProviders = providers.filter(p => p.type === 'claude-web' || p.type === 'chatgpt-web' || p.type === 'bud-web' || p.type === 'devin-web');
+  const webProviders = providers.filter(isWebLoginProvider);
 
-  const oauthCount = providers.filter(p => p.auth_type === 'oauth' || p.notes?.toLowerCase().includes('oauth')).length;
-  const cookieCount = providers.filter(p => p.auth_type === 'cookies' && !p.notes?.toLowerCase().includes('oauth')).length;
+  const oauthCount = providers.filter(p => !isWebLoginProvider(p) && p.auth_type === 'oauth').length;
+  const webLoginCount = webProviders.length;
   const keyCount = providers.filter(p => p.api_key && p.auth_type !== 'oauth').length;
   const enabledCount = providers.filter(p => p.enabled).length;
 
@@ -430,8 +438,9 @@ export default function ProvidersPage() {
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className="text-sm font-medium text-gray-100">{p.name}</span>
                     <span className={meta.color}>{meta.label}</span>
-                    {(p.auth_type === 'oauth' || p.notes?.toLowerCase().includes('oauth')) && <span className="badge-blue">OAuth</span>}
-                    {p.auth_type === 'cookies' && !p.notes?.toLowerCase().includes('oauth') && <span className="badge-yellow">Cookies</span>}
+                    {isWebLoginProvider(p) && <span className="badge-yellow">Web Login</span>}
+                    {!isWebLoginProvider(p) && p.auth_type === 'oauth' && <span className="badge-blue">OAuth</span>}
+                    {!isWebLoginProvider(p) && p.auth_type === 'cookies' && <span className="badge-yellow">Cookies</span>}
                     {p.api_key && p.auth_type !== 'oauth' && <span className="badge-gray">Key</span>}
                     <span className="badge-gray">{p.enabled_account_count ?? 0}/{p.account_count ?? 0} accounts</span>
                   </div>
@@ -466,8 +475,8 @@ export default function ProvidersPage() {
                         <div className="flex-1 min-w-0">
                           <div className="flex items-center gap-2 flex-wrap">
                             <span className="text-xs font-medium text-gray-200">{account.name}</span>
-                            <span className={account.auth_type === 'oauth' ? 'badge-blue' : account.auth_type === 'cookies' ? 'badge-yellow' : 'badge-gray'}>
-                              {account.auth_type ?? 'key'}
+                            <span className={isWebLoginProvider(p) ? 'badge-yellow' : account.auth_type === 'oauth' ? 'badge-blue' : account.auth_type === 'cookies' ? 'badge-yellow' : 'badge-gray'}>
+                              {isWebLoginProvider(p) ? 'web login' : account.auth_type ?? 'key'}
                             </span>
                             {account.enabled ? <span className="badge-green">Active</span> : <span className="badge-gray">Disabled</span>}
                           </div>
@@ -599,6 +608,9 @@ export default function ProvidersPage() {
                 <p className="text-xs text-muted">
                   Login OAuth will create or update this provider automatically. No API key paste is needed.
                 </p>
+                {selectedPreset.notes && (
+                  <p className="text-xs text-muted">{selectedPreset.notes}</p>
+                )}
                 <button className="btn-primary w-full" disabled={loading} onClick={connectOAuth}>
                   {loading ? 'Connecting...' : `Login with ${oauthLabel(selectedPreset.oauth)}`}
                 </button>
@@ -652,7 +664,7 @@ export default function ProvidersPage() {
 
             {isCookieBased && (
               <p className="text-xs text-warning bg-warning/10 border border-warning/20 rounded px-3 py-2">
-                Cookie-based provider - use the Chrome Extension or the Cookie Injection panel below to set cookies after saving.
+                Web login provider - create it, log in on the provider website, then use the Chrome Extension or Cookie Injection panel to import the session.
               </p>
             )}
 
@@ -808,15 +820,15 @@ export default function ProvidersPage() {
               <p className="text-lg text-success mt-1">{keyCount}</p>
             </div>
             <div className="bg-base-700 rounded p-3">
-              <p className="text-muted">Cookies</p>
-              <p className="text-lg text-warning mt-1">{cookieCount}</p>
+              <p className="text-muted">Web Login</p>
+              <p className="text-lg text-warning mt-1">{webLoginCount}</p>
             </div>
           </div>
         </div>
 
         <div className="card space-y-2">
           <h3 className="text-sm font-medium">Flow Guide</h3>
-          <p className="text-xs text-muted">Use OAuth when supported. Use Web Cookie only for website adapters such as Bud and Devin.</p>
+          <p className="text-xs text-muted">OAuth is for gateway/device-code login flows. Web Login is for website adapters such as ZenMux, Bud, and Devin.</p>
           <p className="text-xs text-muted">API Key providers are the most stable choice for VPS deployments.</p>
         </div>
       </aside>

@@ -236,6 +236,134 @@ function webPageError(status: number, base: string): Error {
   );
 }
 
+function objectValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function stringValue(value: unknown): string | undefined {
+  if (typeof value === 'string' && value.trim()) return value.trim();
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  return undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+function stringArray(value: unknown): string[] | undefined {
+  if (Array.isArray(value)) {
+    const out = value
+      .map(item => stringValue(item)?.toLowerCase())
+      .filter((item): item is string => !!item);
+    return out.length ? Array.from(new Set(out)) : undefined;
+  }
+  const single = stringValue(value)?.toLowerCase();
+  return single ? [single] : undefined;
+}
+
+function firstNumber(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    const parsed = numberValue(value);
+    if (parsed !== undefined) return parsed;
+  }
+  return undefined;
+}
+
+function modelContextLength(model: Record<string, unknown>): number | undefined {
+  const topProvider = objectValue(model.top_provider);
+  const limits = objectValue(model.limits);
+  return firstNumber(
+    model.context_length,
+    model.contextLength,
+    model.max_context_length,
+    model.maxContextLength,
+    model.max_context,
+    model.maxContext,
+    topProvider?.context_length,
+    topProvider?.contextLength,
+    limits?.context_length,
+  );
+}
+
+function normalizePricePerMillion(value: unknown): number | undefined {
+  const price = numberValue(value);
+  if (price === undefined || price < 0) return undefined;
+  return price < 0.001 ? price * 1_000_000 : price;
+}
+
+function modelPricing(model: Record<string, unknown>): { billing?: ModelInfo['billing']; summary?: string } {
+  const pricing = objectValue(model.pricing) ?? objectValue(model.prices);
+  if (!pricing) return {};
+
+  const prompt = normalizePricePerMillion(pricing.prompt ?? pricing.input ?? pricing.input_tokens);
+  const completion = normalizePricePerMillion(pricing.completion ?? pricing.output ?? pricing.output_tokens);
+  const image = normalizePricePerMillion(pricing.image);
+  const request = normalizePricePerMillion(pricing.request);
+  const cacheRead = normalizePricePerMillion(pricing.input_cache_read ?? pricing.cache_read);
+  const cacheWrite = normalizePricePerMillion(pricing.input_cache_write ?? pricing.cache_write);
+  const prices = [prompt, completion, image, request, cacheRead, cacheWrite].filter((price): price is number => price !== undefined);
+  const billing = prices.length ? (prices.some(price => price > 0) ? 'premium' : 'free') : undefined;
+
+  const fmt = (price: number) => {
+    if (price === 0) return '$0';
+    if (price < 0.01) return `$${price.toFixed(4)}`;
+    if (price < 1) return `$${price.toFixed(3).replace(/0+$/, '').replace(/\.$/, '')}`;
+    return `$${price.toFixed(2).replace(/0+$/, '').replace(/\.$/, '')}`;
+  };
+  const parts: string[] = [];
+  if (prompt !== undefined) parts.push(`${fmt(prompt)} in`);
+  if (completion !== undefined) parts.push(`${fmt(completion)} out`);
+  if (image !== undefined && image > 0) parts.push(`${fmt(image)} image`);
+  if (request !== undefined && request > 0) parts.push(`${fmt(request)} req`);
+  const summary = parts.length ? `${parts.join(' / ')} perM tokens` : undefined;
+  return { billing, summary };
+}
+
+function modelModalities(model: Record<string, unknown>): { input?: string[]; output?: string[] } {
+  const architecture = objectValue(model.architecture);
+  const input = stringArray(model.input_modalities)
+    ?? stringArray(architecture?.input_modalities)
+    ?? stringArray(model.inputs);
+  const output = stringArray(model.output_modalities)
+    ?? stringArray(architecture?.output_modalities)
+    ?? stringArray(model.outputs);
+  return { input, output };
+}
+
+function modelFeatures(model: Record<string, unknown>, input?: string[], output?: string[]): string[] | undefined {
+  const id = stringValue(model.id)?.toLowerCase() ?? '';
+  const supported = stringArray(model.supported_parameters) ?? [];
+  const features = new Set<string>();
+  if (id.includes('reason') || supported.some(item => item.includes('reasoning'))) features.add('reasoning');
+  if (input?.includes('image')) features.add('vision');
+  if (input?.includes('file')) features.add('files');
+  if (output?.includes('image')) features.add('image-out');
+  if (output?.includes('audio')) features.add('audio-out');
+  if (supported.includes('tools') || supported.includes('tool_choice')) features.add('tools');
+  if (supported.includes('response_format') || supported.includes('structured_outputs')) features.add('json');
+  return features.size ? Array.from(features) : undefined;
+}
+
+function enrichOpenAIModel(model: Record<string, unknown>): Partial<ModelInfo> {
+  const { billing, summary } = modelPricing(model);
+  const { input, output } = modelModalities(model);
+  return {
+    context_length: modelContextLength(model),
+    billing,
+    pricing_summary: summary,
+    input_modalities: input,
+    output_modalities: output,
+    features: modelFeatures(model, input, output),
+  };
+}
+
 export const OpenAIAdapter: ProviderAdapter = {
   type: 'openai',
 
@@ -251,19 +379,27 @@ export const OpenAIAdapter: ProviderAdapter = {
     }
     if (contentType.includes('text/html') || looksLikeHtml(text)) throw webPageError(res.status, base);
 
-    let data: { data?: { id: string; owned_by?: string; created?: number }[] };
+    let data: { data?: Record<string, unknown>[] };
     try {
-      data = JSON.parse(text) as { data?: { id: string; owned_by?: string; created?: number }[] };
+      data = JSON.parse(text) as { data?: Record<string, unknown>[] };
     } catch {
       throw new Error(`HTTP ${res.status}: ${url} did not return valid JSON. Check that the provider base URL points to an OpenAI-compatible API endpoint.`);
     }
-    return (data.data ?? []).map(m => ({
-      id: m.id,
-      name: m.id,
-      capability: classifyModelCapability(m.id, m.owned_by),
-      owned_by: m.owned_by,
-      created: m.created,
-    }));
+    const models: ModelInfo[] = [];
+    for (const m of data.data ?? []) {
+        const id = stringValue(m.id);
+        if (!id) continue;
+        const ownedBy = stringValue(m.owned_by ?? m.ownedBy ?? m.provider ?? m.author);
+        models.push({
+          id,
+          name: stringValue(m.name) ?? id,
+          capability: classifyModelCapability(id, ownedBy),
+          owned_by: ownedBy,
+          created: numberValue(m.created),
+          ...enrichOpenAIModel(m),
+        });
+    }
+    return models;
   },
 
   async complete(config, req) {

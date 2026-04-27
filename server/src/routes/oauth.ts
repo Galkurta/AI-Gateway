@@ -6,10 +6,10 @@ import { db } from '../db/index.js';
 
 type OAuthProvider =
   | 'iflow' | 'qwen' | 'github' | 'kimi-coding' | 'kilocode' | 'codebuddy' | 'claude' | 'cline'
-  | 'gemini-cli' | 'antigravity' | 'codex' | 'kiro' | 'cursor' | 'gitlab';
+  | 'gemini-cli' | 'antigravity' | 'codex' | 'kiro' | 'cursor' | 'gitlab' | 'zenmux';
 
 type OAuthStatus =
-  | { status: 'pending'; provider: OAuthProvider; createdAt: number; targetProviderId?: string; deviceCode?: string; codeVerifier?: string; intervalMs?: number; lastPollAt?: number; userCode?: string; verificationUri?: string; authUrl?: string; redirectUri?: string }
+  | { status: 'pending'; provider: OAuthProvider; createdAt: number; targetProviderId?: string; deviceCode?: string; codeVerifier?: string; intervalMs?: number; lastPollAt?: number; userCode?: string; verificationUri?: string; authUrl?: string; redirectUri?: string; zenmuxCookies?: Record<string, string>; zenmuxState?: string; zenmuxProvider?: 'github' | 'google' }
   | { status: 'complete'; provider: OAuthProvider; createdAt: number; providerId: string; email?: string }
   | { status: 'error'; provider: OAuthProvider; createdAt: number; error: string };
 
@@ -50,6 +50,7 @@ const GITLAB_CLIENT_ID = process.env.GITLAB_CLIENT_ID ?? '';
 const GITLAB_CLIENT_SECRET = process.env.GITLAB_CLIENT_SECRET ?? '';
 
 const oauthSessions = new Map<string, OAuthStatus>();
+const zenmuxStateIndex = new Map<string, string>();
 let codexProxyServer: Server | null = null;
 let codexProxyTimer: NodeJS.Timeout | null = null;
 
@@ -583,6 +584,7 @@ function providerAccountMatch(provider: OAuthProvider, email?: string): { clause
 
 function providerDisplayName(provider: OAuthProvider): string {
   switch (provider) {
+    case 'zenmux': return 'ZenMux OAuth';
     case 'gemini-cli': return 'Gemini CLI OAuth';
     case 'antigravity': return 'Antigravity OAuth';
     case 'codex': return 'Codex OAuth';
@@ -597,6 +599,42 @@ function providerDisplayName(provider: OAuthProvider): string {
     case 'codebuddy': return 'CodeBuddy OAuth';
     case 'qwen': return 'Qwen OAuth';
     case 'iflow': return 'iFlow AI';
+  }
+}
+
+function splitSetCookie(header: string | null): string[] {
+  if (!header) return [];
+  return header.split(/,(?=\s*[^;,=\s]+=[^;,]*)/g).map(part => part.trim()).filter(Boolean);
+}
+
+function responseCookies(res: Response): Record<string, string> {
+  const headers = res.headers as Headers & { getSetCookie?: () => string[] };
+  const rawCookies = typeof headers.getSetCookie === 'function'
+    ? headers.getSetCookie()
+    : splitSetCookie(res.headers.get('set-cookie'));
+  const out: Record<string, string> = {};
+  for (const raw of rawCookies) {
+    const first = raw.split(';', 1)[0] ?? '';
+    const idx = first.indexOf('=');
+    if (idx <= 0) continue;
+    out[first.slice(0, idx)] = first.slice(idx + 1);
+  }
+  return out;
+}
+
+function cookieHeaderFromRecord(cookies: Record<string, string>): string {
+  return Object.entries(cookies).map(([key, value]) => `${key}=${value}`).join('; ');
+}
+
+function parseJsonRecord(value: string | null | undefined): Record<string, unknown> {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
   }
 }
 
@@ -712,6 +750,180 @@ function upsertBearerProvider(options: {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
   `).run(id, name, options.type, options.baseUrl, options.accessToken, cookies, extraHeaders, options.notes, now, now);
   return id;
+}
+
+function upsertZenMuxOAuthShell(targetProviderId?: string): string {
+  const now = Date.now();
+  const notes = 'Connected via ZenMux website OAuth. The Chrome extension imports the resulting ZenMux web session.';
+  const baseUrl = 'https://zenmux.ai';
+  const marker = {
+    oauth_provider: 'zenmux',
+    oauth_account: 'zenmux-web-session',
+    oauth_pending_since: new Date(now).toISOString(),
+  };
+
+  if (targetProviderId) {
+    const existing = db.prepare('SELECT id, name, cookies, notes FROM providers WHERE id = ?').get(targetProviderId) as {
+      id: string; name: string; cookies: string | null; notes: string | null;
+    } | undefined;
+    if (!existing) throw new Error('Target provider not found for ZenMux OAuth.');
+    const cookies = JSON.stringify({ ...parseJsonRecord(existing.cookies), ...marker });
+    db.prepare(`
+      UPDATE providers SET type = 'zenmux-web', base_url = ?, cookies = ?, notes = ?, enabled = 1, updated_at = ?
+      WHERE id = ?
+    `).run(baseUrl, cookies, existing.notes || notes, now, existing.id);
+    return existing.id;
+  }
+
+  const existing = db.prepare(`
+    SELECT id, cookies FROM providers
+    WHERE name = ? OR cookies LIKE ?
+    ORDER BY created_at ASC LIMIT 1
+  `).get(providerDisplayName('zenmux'), '%"oauth_provider":"zenmux"%') as { id: string; cookies: string | null } | undefined;
+  const cookies = JSON.stringify({ ...parseJsonRecord(existing?.cookies), ...marker });
+  if (existing) {
+    db.prepare(`
+      UPDATE providers SET name = ?, type = 'zenmux-web', base_url = ?, cookies = ?, notes = ?, enabled = 1, updated_at = ?
+      WHERE id = ?
+    `).run(providerDisplayName('zenmux'), baseUrl, cookies, notes, now, existing.id);
+    return existing.id;
+  }
+
+  const id = uuid();
+  db.prepare(`
+    INSERT INTO providers (id, name, type, base_url, api_key, cookies, extra_headers, notes, priority, enabled, created_at, updated_at)
+    VALUES (?, ?, 'zenmux-web', ?, NULL, ?, NULL, ?, 0, 1, ?, ?)
+  `).run(id, providerDisplayName('zenmux'), baseUrl, cookies, notes, now, now);
+  return id;
+}
+
+function storeZenMuxOAuthCookies(providerId: string, cookies: Record<string, string>, account?: string): void {
+  const existing = db.prepare('SELECT cookies, notes FROM providers WHERE id = ?').get(providerId) as {
+    cookies: string | null; notes: string | null;
+  } | undefined;
+  if (!existing) throw new Error('ZenMux provider not found.');
+  const now = Date.now();
+  const merged = {
+    ...parseJsonRecord(existing.cookies),
+    ...cookies,
+    oauth_provider: 'zenmux',
+    oauth_account: account ?? 'zenmux-github',
+    connected_at: new Date(now).toISOString(),
+  };
+  db.prepare(`
+    UPDATE providers SET cookies = ?, notes = ?, enabled = 1, updated_at = ?
+    WHERE id = ?
+  `).run(
+    JSON.stringify(merged),
+    existing.notes || 'Connected via ZenMux GitHub OAuth',
+    now,
+    providerId,
+  );
+}
+
+function zenMuxCookieReady(providerId: string): { ready: boolean; email?: string } {
+  const row = db.prepare('SELECT cookies, updated_at FROM providers WHERE id = ?').get(providerId) as {
+    cookies: string | null; updated_at: number;
+  } | undefined;
+  const cookies = parseJsonRecord(row?.cookies);
+  const hasSession = typeof cookies.sessionId === 'string'
+    || typeof cookies.sessionid === 'string'
+    || typeof cookies.__zenmux_bearer === 'string'
+    || typeof cookies.zenmux_bearer === 'string'
+    || typeof cookies.zenmux_access_token === 'string'
+    || typeof cookies.access_token === 'string';
+  const hasCsrf = typeof cookies.ctoken === 'string'
+    || typeof cookies.zenmux_ctoken === 'string'
+    || typeof cookies.zenmux_csrf_token === 'string';
+  const hasLoginState = cookies.storage_ZENMUX_STATE === 'ACTIVE';
+  const hasBearer = typeof cookies.__zenmux_bearer === 'string'
+    || typeof cookies.zenmux_bearer === 'string'
+    || typeof cookies.zenmux_access_token === 'string'
+    || typeof cookies.access_token === 'string';
+  const ready = hasSession && hasCsrf && (hasLoginState || hasBearer);
+  const account = typeof cookies.oauth_account === 'string' && cookies.oauth_account !== 'zenmux-web-session'
+    ? cookies.oauth_account
+    : undefined;
+  return { ready, email: account };
+}
+
+function buildZenMuxLaunchUrl(req: Request, state: string, providerId: string): string {
+  const params = new URLSearchParams({ state, provider_id: providerId });
+  return `${publicBaseUrl(req)}/oauth/zenmux/launch?${params}`;
+}
+
+async function startZenMuxFullOAuth(req: Request, gatewayState: string, targetProviderId?: string): Promise<{ providerId: string; authUrl: string; upstreamState: string; cookies: Record<string, string> }> {
+  const providerId = upsertZenMuxOAuthShell(targetProviderId);
+  const startRes = await fetch('https://zenmux.ai/api/login/auth/github', {
+    headers: {
+      Accept: 'application/json',
+      Referer: 'https://zenmux.ai/',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    },
+  });
+  const cookies = responseCookies(startRes);
+  const json = await readJson(startRes);
+  if (!startRes.ok || json.success !== true || typeof json.data !== 'string') {
+    throw new Error(`ZenMux OAuth start failed ${startRes.status}: ${JSON.stringify(json)}`);
+  }
+
+  const authUrl = new URL(json.data);
+  const upstreamState = authUrl.searchParams.get('state') ?? '';
+  if (!upstreamState) throw new Error('ZenMux OAuth start did not return state.');
+  const redirectUri = `${publicBaseUrl(req)}/oauth/zenmux/callback`;
+  authUrl.searchParams.set('redirect_uri', redirectUri);
+  zenmuxStateIndex.set(upstreamState, gatewayState);
+  return { providerId, authUrl: authUrl.toString(), upstreamState, cookies };
+}
+
+async function handleZenMuxCallback(req: Request, res: ExpressResponse): Promise<void> {
+  const upstreamState = typeof req.query.state === 'string' ? req.query.state : '';
+  const gatewayState = zenmuxStateIndex.get(upstreamState) ?? upstreamState;
+  const code = typeof req.query.code === 'string' ? req.query.code : '';
+  const error = typeof req.query.error === 'string' ? req.query.error : '';
+  const session = oauthSessions.get(gatewayState);
+  const createdAt = session?.createdAt ?? Date.now();
+
+  try {
+    if (!session || session.provider !== 'zenmux' || session.status !== 'pending') throw new Error('OAuth state is invalid or expired.');
+    if (error) throw new Error(error);
+    if (!code || !upstreamState) throw new Error('OAuth callback did not include code/state.');
+    if (!session.targetProviderId) throw new Error('ZenMux provider id is missing.');
+
+    const cookies = session.zenmuxCookies ?? {};
+    const ctoken = cookies.ctoken;
+    const callbackUrl = new URL('https://zenmux.ai/api/login/auth/github/callback');
+    callbackUrl.searchParams.set('code', code);
+    callbackUrl.searchParams.set('state', upstreamState);
+    if (ctoken) callbackUrl.searchParams.set('ctoken', ctoken);
+
+    const callbackRes = await fetch(callbackUrl, {
+      headers: {
+        Accept: 'application/json',
+        Cookie: cookieHeaderFromRecord(cookies),
+        Origin: 'https://zenmux.ai',
+        Referer: `https://zenmux.ai/?provider=github&code=${encodeURIComponent(code)}&state=${encodeURIComponent(upstreamState)}`,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        ...(ctoken ? { 'X-CSRF-Token': ctoken, 'x-csrf-token': ctoken, 'x-ctoken': ctoken } : {}),
+      },
+    });
+    const body = await callbackRes.text();
+    let parsed: Record<string, unknown> = {};
+    try { parsed = JSON.parse(body) as Record<string, unknown>; } catch {}
+    if (!callbackRes.ok || parsed.success === false) {
+      throw new Error(`ZenMux callback failed ${callbackRes.status}: ${body.slice(0, 500)}`);
+    }
+
+    const nextCookies = { ...cookies, ...responseCookies(callbackRes) };
+    storeZenMuxOAuthCookies(session.targetProviderId, nextCookies);
+    zenmuxStateIndex.delete(upstreamState);
+    oauthSessions.set(gatewayState, { status: 'complete', provider: 'zenmux', createdAt, providerId: session.targetProviderId });
+    res.type('html').send('<!doctype html><html><body><script>window.close()</script><p>ZenMux connected. You can close this tab.</p></body></html>');
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    oauthSessions.set(gatewayState || randomBytes(8).toString('hex'), { status: 'error', provider: 'zenmux', createdAt, error: message });
+    res.status(400).type('html').send(`<!doctype html><html><body><p>ZenMux OAuth failed: ${message}</p></body></html>`);
+  }
 }
 
 type DeviceStart = {
@@ -1239,7 +1451,7 @@ oauthAdminRouter.get('/qwen/status/:state', async (req, res) => {
 
 oauthAdminRouter.post('/:provider/start', async (req, res) => {
   const provider = req.params.provider as OAuthProvider;
-  if (!['github', 'kimi-coding', 'kilocode', 'codebuddy', 'claude', 'cline', 'gemini-cli', 'antigravity', 'codex', 'kiro', 'gitlab'].includes(provider)) {
+  if (!['github', 'kimi-coding', 'kilocode', 'codebuddy', 'claude', 'cline', 'gemini-cli', 'antigravity', 'codex', 'kiro', 'gitlab', 'zenmux'].includes(provider)) {
     res.status(404).json({ error: `OAuth provider not supported here: ${req.params.provider}` });
     return;
   }
@@ -1247,6 +1459,24 @@ oauthAdminRouter.post('/:provider/start', async (req, res) => {
   const state = randomBytes(24).toString('base64url');
   const targetProviderId = targetProviderIdFromRequest(req);
   try {
+    if (provider === 'zenmux') {
+      const zenmux = await startZenMuxFullOAuth(req, state, targetProviderId);
+      oauthSessions.set(state, {
+        status: 'pending',
+        provider,
+        createdAt: Date.now(),
+        targetProviderId: zenmux.providerId,
+        intervalMs: 1500,
+        lastPollAt: 0,
+        authUrl: zenmux.authUrl,
+        zenmuxCookies: zenmux.cookies,
+        zenmuxState: zenmux.upstreamState,
+        zenmuxProvider: 'github',
+      });
+      res.json({ state, authUrl: zenmux.authUrl });
+      return;
+    }
+
     if (provider === 'claude') {
       const { verifier, challenge } = pkcePair();
       const redirectUri = localCallbackUri(req);
@@ -1337,7 +1567,7 @@ oauthAdminRouter.post('/:provider/start', async (req, res) => {
 
 oauthAdminRouter.get('/:provider/status/:state', async (req, res) => {
   const provider = req.params.provider as OAuthProvider;
-  if (!['github', 'kimi-coding', 'kilocode', 'codebuddy', 'claude', 'cline', 'gemini-cli', 'antigravity', 'codex', 'kiro', 'gitlab'].includes(provider)) {
+  if (!['github', 'kimi-coding', 'kilocode', 'codebuddy', 'claude', 'cline', 'gemini-cli', 'antigravity', 'codex', 'kiro', 'gitlab', 'zenmux'].includes(provider)) {
     res.status(404).json({ error: `OAuth provider not supported here: ${req.params.provider}` });
     return;
   }
@@ -1353,6 +1583,25 @@ oauthAdminRouter.get('/:provider/status/:state', async (req, res) => {
   }
   if (status.status !== 'pending') {
     res.json(status);
+    return;
+  }
+  if (provider === 'zenmux') {
+    const providerId = status.targetProviderId;
+    if (!providerId) {
+      const errorStatus: OAuthStatus = { status: 'error', provider, createdAt: status.createdAt, error: 'ZenMux OAuth session is missing provider id.' };
+      oauthSessions.set(req.params.state, errorStatus);
+      res.json(errorStatus);
+      return;
+    }
+    const ready = zenMuxCookieReady(providerId);
+    if (ready.ready) {
+      const complete: OAuthStatus = { status: 'complete', provider, createdAt: status.createdAt, providerId, email: ready.email };
+      oauthSessions.set(req.params.state, complete);
+      res.json(complete);
+      return;
+    }
+    const { deviceCode: _deviceCode, codeVerifier: _codeVerifier, ...safe } = status;
+    res.json(safe);
     return;
   }
   if (provider === 'claude' || provider === 'cline' || provider === 'gemini-cli' || provider === 'antigravity' || provider === 'codex' || provider === 'gitlab') {
@@ -1620,6 +1869,38 @@ async function handleGitlabCallback(req: Request, res: ExpressResponse): Promise
 
 oauthPublicRouter.get('/gitlab/callback', (req, res) => { void handleGitlabCallback(req, res); });
 
+oauthPublicRouter.get('/zenmux/launch', (req, res) => {
+  const state = typeof req.query.state === 'string' ? req.query.state : '';
+  const session = oauthSessions.get(state);
+  if (!session || session.provider !== 'zenmux' || session.status !== 'pending') {
+    res.status(400).type('html').send('<!doctype html><html><body><p>ZenMux OAuth state is invalid or expired.</p></body></html>');
+    return;
+  }
+  const providerId = typeof req.query.provider_id === 'string' ? req.query.provider_id : session.targetProviderId ?? '';
+  const zenMuxUrl = `https://zenmux.ai/?${new URLSearchParams({
+    ai_gateway_provider_id: providerId,
+    ai_gateway_oauth_state: state,
+  })}`;
+  res.type('html').send(`<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="refresh" content="1;url=${zenMuxUrl}">
+    <title>ZenMux OAuth</title>
+    <style>
+      body { font-family: system-ui, sans-serif; background: #0d1117; color: #e6edf3; padding: 24px; }
+      a { color: #58a6ff; }
+    </style>
+  </head>
+  <body>
+    <p>Opening ZenMux login. Keep the AI Gateway Chrome extension enabled so it can import the ZenMux session after login.</p>
+    <p><a href="${zenMuxUrl}">Continue to ZenMux</a></p>
+  </body>
+</html>`);
+});
+
+oauthPublicRouter.get('/zenmux/callback', (req, res) => { void handleZenMuxCallback(req, res); });
+
 oauthPublicRouter.get('/callback', (req, res) => {
   const state = typeof req.query.state === 'string' ? req.query.state : '';
   const session = oauthSessions.get(state);
@@ -1649,6 +1930,9 @@ oauthPublicRouter.get('/callback', (req, res) => {
       return;
     case 'gitlab':
       void handleGitlabCallback(req, res);
+      return;
+    case 'zenmux':
+      void handleZenMuxCallback(req, res);
       return;
     default:
       res.status(400).type('html').send(`<!doctype html><html><body><p>${session.provider} does not use callback OAuth.</p></body></html>`);

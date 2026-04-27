@@ -32,6 +32,10 @@ const CLIENTS = {
     id: process.env.GITLAB_CLIENT_ID ?? '',
     secret: process.env.GITLAB_CLIENT_SECRET ?? '',
   },
+  devin: {
+    domain: process.env.DEVIN_AUTH0_DOMAIN ?? 'auth.devin.ai',
+    id: process.env.DEVIN_AUTH0_CLIENT_ID ?? 'DjKr4B4qtVDBVMBzE4FvveclTSkJYfhk',
+  },
 };
 
 function str(value: unknown): string | undefined {
@@ -288,6 +292,25 @@ async function refreshCodeBuddy(refreshToken: string): Promise<RefreshResult | n
   };
 }
 
+async function refreshDevin(refreshToken: string): Promise<RefreshResult | null> {
+  const json = await postForm(`https://${CLIENTS.devin.domain}/oauth/token`, {
+    grant_type: 'refresh_token',
+    refresh_token: refreshToken,
+    client_id: CLIENTS.devin.id,
+  });
+  const result = json ? standardResult(json, refreshToken) : null;
+  if (!result?.accessToken) return null;
+  return {
+    ...result,
+    extraCookies: {
+      __devin_bearer: result.accessToken,
+      devin_bearer: result.accessToken,
+      __devin_token_source: 'auth0-refresh',
+      devin_token_source: 'auth0-refresh',
+    },
+  };
+}
+
 function saveRefresh(config: ProviderConfig, provider: string, result: RefreshResult): void {
   const now = Date.now();
   const nextApiKey = result.apiKey ?? result.accessToken ?? config.apiKey;
@@ -368,6 +391,9 @@ export async function refreshOAuthToken(config: ProviderConfig, force = false): 
         break;
       case 'codebuddy':
         result = await refreshCodeBuddy(refreshToken);
+        break;
+      case 'devin':
+        result = await refreshDevin(refreshToken);
         break;
       default:
         return false;

@@ -98,6 +98,11 @@ export type ModelInfo = {
   id: string; name: string; owned_by?: string;
   capability?: ModelCapability;
   context_length?: number; provider_id: string; provider_name: string;
+  billing?: 'free' | 'premium' | 'unknown';
+  pricing_summary?: string;
+  input_modalities?: string[];
+  output_modalities?: string[];
+  features?: string[];
   source_id?: string; alias_of?: string; forked_alias?: boolean;
 };
 

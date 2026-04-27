@@ -8,6 +8,7 @@ import { ChatGPTWebAdapter } from './adapters/chatgpt-web.js';
 import { BudWebAdapter } from './adapters/bud-web.js';
 import { DevinWebAdapter } from './adapters/devin-web.js';
 import { PerplexityWebAdapter } from './adapters/perplexity-web.js';
+import { ZenMuxWebAdapter } from './adapters/zenmux-web.js';
 import { GeminiCliAdapter, AntigravityAdapter } from './adapters/cloudcode.js';
 import { CodexAdapter } from './adapters/codex.js';
 import { CursorAdapter, KiroAdapter } from './adapters/not-ported.js';
@@ -24,6 +25,7 @@ const ADAPTERS: Record<ProviderType, ProviderAdapter> = {
   'bud-web': BudWebAdapter,
   'devin-web': DevinWebAdapter,
   'perplexity-web': PerplexityWebAdapter,
+  'zenmux-web': ZenMuxWebAdapter,
   'gemini-cli': GeminiCliAdapter,
   'antigravity': AntigravityAdapter,
   'codex': CodexAdapter,
@@ -39,6 +41,7 @@ const DEFAULT_BASE_URLS: Partial<Record<ProviderType, string>> = {
   'gemini-cli': 'https://cloudcode-pa.googleapis.com/v1internal',
   'antigravity': 'https://daily-cloudcode-pa.googleapis.com',
   'codex': 'https://chatgpt.com/backend-api/codex/responses',
+  'zenmux-web': 'https://zenmux.ai',
   'gitlab': 'https://gitlab.com/api/v4',
   'ollama': 'http://localhost:11434',
 };
@@ -48,6 +51,7 @@ function effectiveProviderType(p: Pick<Provider, 'type' | 'base_url'>): Provider
   if (base.includes('app.devin.ai')) return 'devin-web';
   if (base.includes('bud.app')) return 'bud-web';
   if (base.includes('perplexity.ai') && !base.includes('api.perplexity.ai')) return 'perplexity-web';
+  if (base.includes('zenmux.ai') && !base.includes('/api/')) return 'zenmux-web';
   if (base.includes('claude.ai')) return 'claude-web';
   if (base.includes('chatgpt.com') || base.includes('chat.openai.com')) return 'chatgpt-web';
   return p.type as ProviderType;

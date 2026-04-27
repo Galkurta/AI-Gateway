@@ -136,8 +136,8 @@ app.post("/ext/cookies/:providerId", (req, res) => {
   }
 
   const p = db
-    .prepare("SELECT id, type, extra_headers FROM providers WHERE id = ?")
-    .get(req.params.providerId) as { id: string; type: string; extra_headers: string | null } | undefined;
+    .prepare("SELECT id, type, cookies, extra_headers FROM providers WHERE id = ?")
+    .get(req.params.providerId) as { id: string; type: string; cookies: string | null; extra_headers: string | null } | undefined;
   if (!p) {
     res.status(404).json({ error: "Provider not found" });
     return;
@@ -154,7 +154,8 @@ app.post("/ext/cookies/:providerId", (req, res) => {
       return;
     }
 
-    const extraHeaders = mergeWebCookieHeaders(p.type, cookies, parseRecord(existing?.extra_headers ?? p.extra_headers));
+    const mergedCookies = { ...parseRecord(existing?.cookies ?? p.cookies), ...cookies };
+    const extraHeaders = mergeWebCookieHeaders(p.type, mergedCookies, parseRecord(existing?.extra_headers ?? p.extra_headers));
     const id = existing?.id ?? randomUUID();
     const name = existing?.name ?? inferredName ?? "Cookie Account";
     db.prepare(`
@@ -171,7 +172,7 @@ app.post("/ext/cookies/:providerId", (req, res) => {
       id,
       p.id,
       name,
-      JSON.stringify(cookies),
+      JSON.stringify(mergedCookies),
       Object.keys(extraHeaders).length ? JSON.stringify(extraHeaders) : null,
       now,
       now,
@@ -181,11 +182,12 @@ app.post("/ext/cookies/:providerId", (req, res) => {
     return;
   }
 
-  const extraHeaders = mergeWebCookieHeaders(p.type, cookies, parseRecord(p.extra_headers));
+  const mergedCookies = { ...parseRecord(p.cookies), ...cookies };
+  const extraHeaders = mergeWebCookieHeaders(p.type, mergedCookies, parseRecord(p.extra_headers));
   db.prepare(
     "UPDATE providers SET cookies = ?, extra_headers = ?, updated_at = ? WHERE id = ?",
   ).run(
-    JSON.stringify(cookies),
+    JSON.stringify(mergedCookies),
     Object.keys(extraHeaders).length ? JSON.stringify(extraHeaders) : p.extra_headers,
     now,
     req.params.providerId,
@@ -212,12 +214,14 @@ app.post("/ext/cookies/:providerId", (req, res) => {
   // Dynamic import to avoid circular — just use db directly
   import("./db/index.js").then(({ db }) => {
     const p = db
-      .prepare("SELECT id, type, extra_headers FROM providers WHERE id = ?")
-      .get(req.params.providerId) as { id: string; type: string; extra_headers: string | null } | undefined;
+      .prepare("SELECT id, type, cookies, extra_headers FROM providers WHERE id = ?")
+      .get(req.params.providerId) as { id: string; type: string; cookies: string | null; extra_headers: string | null } | undefined;
     if (!p) {
       res.status(404).json({ error: "Provider not found" });
       return;
     }
+    const existingCookies = parseRecord(p.cookies);
+    const mergedCookies = { ...existingCookies, ...cookies };
     const extraHeaders = (() => {
       try {
         return p.extra_headers ? JSON.parse(p.extra_headers) as Record<string, string> : {};
@@ -226,16 +230,16 @@ app.post("/ext/cookies/:providerId", (req, res) => {
       }
     })();
     if (p.type === "bud-web") {
-      if (cookies.bud_projectid) extraHeaders["X-Bud-ProjectId"] = cookies.bud_projectid;
-      if (cookies.bud_userid) extraHeaders["X-Bud-UserId"] = cookies.bud_userid;
-      if (cookies.bud_chatsessionid) extraHeaders["X-Bud-ChatSessionId"] = cookies.bud_chatsessionid;
-      if (cookies.bud_template) extraHeaders["X-Bud-Template"] = cookies.bud_template;
+      if (mergedCookies.bud_projectid) extraHeaders["X-Bud-ProjectId"] = mergedCookies.bud_projectid;
+      if (mergedCookies.bud_userid) extraHeaders["X-Bud-UserId"] = mergedCookies.bud_userid;
+      if (mergedCookies.bud_chatsessionid) extraHeaders["X-Bud-ChatSessionId"] = mergedCookies.bud_chatsessionid;
+      if (mergedCookies.bud_template) extraHeaders["X-Bud-Template"] = mergedCookies.bud_template;
     }
 
     db.prepare(
       "UPDATE providers SET cookies = ?, extra_headers = ?, updated_at = ? WHERE id = ?",
     ).run(
-      JSON.stringify(cookies),
+      JSON.stringify(mergedCookies),
       Object.keys(extraHeaders).length ? JSON.stringify(extraHeaders) : p.extra_headers,
       Date.now(),
       req.params.providerId,

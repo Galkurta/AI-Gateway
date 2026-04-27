@@ -2,7 +2,7 @@
   let currentTab = null;
   let providers = [];
   let providerAccounts = {};
-  const WEB_COOKIE_TYPES = new Set(['claude-web', 'chatgpt-web', 'bud-web', 'devin-web', 'perplexity-web']);
+  const WEB_COOKIE_TYPES = new Set(['claude-web', 'chatgpt-web', 'bud-web', 'devin-web', 'perplexity-web', 'zenmux-web']);
 
   const $ = id => document.getElementById(id);
 
@@ -67,6 +67,7 @@
       'bud-web':           ['Bud Web',         'badge-green'],
       'devin-web':         ['Devin Web',       'badge-green'],
       'perplexity-web':    ['Perplexity Web',  'badge-yellow'],
+      'zenmux-web':        ['ZenMux Web',      'badge-yellow'],
       'ollama':            ['Ollama',         'badge-yellow'],
     };
     const [label, cls] = map[type] ?? [type, 'badge-gray'];

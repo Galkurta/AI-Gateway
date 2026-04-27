@@ -53,9 +53,10 @@ export const PROVIDER_PRESETS: ProviderPreset[] = ([
   { id: 'minimax', name: 'MiniMax', type: 'anthropic-compatible', base_url: 'https://api.minimax.io/anthropic' },
   { id: 'minimax-cn', name: 'MiniMax China', type: 'anthropic-compatible', base_url: 'https://api.minimaxi.com/anthropic' },
   { id: 'ollama-local', name: 'Ollama Local', type: 'ollama', base_url: 'http://localhost:11434', flow: 'local' },
-  { id: 'bud-web', name: 'Bud Web', type: 'bud-web', base_url: 'https://bud.app', flow: 'web-cookie' },
-  { id: 'devin-web', name: 'Devin Web', type: 'devin-web', base_url: 'https://app.devin.ai', flow: 'web-cookie' },
+  { id: 'bud-web', name: 'Bud Web Login', type: 'bud-web', base_url: 'https://bud.app', flow: 'web-cookie', notes: 'Bud uses Google login through Clerk on bud.app. Create the provider, log in on bud.app, then import the session with the Chrome extension.' },
+  { id: 'devin-web', name: 'Devin Web Login', type: 'devin-web', base_url: 'https://app.devin.ai', flow: 'web-cookie', notes: 'Devin uses Google/Auth0 login on app.devin.ai. Create the provider, log in on app.devin.ai, then import the session with the Chrome extension.' },
   { id: 'perplexity-web', name: 'Perplexity Web (Free)', type: 'perplexity-web', base_url: 'https://www.perplexity.ai', flow: 'web-cookie', notes: 'Uses session cookies from perplexity.ai. Extract with Chrome extension. Free account — no API key required.' },
+  { id: 'zenmux-web', name: 'ZenMux Web Login', type: 'zenmux-web', base_url: 'https://zenmux.ai', flow: 'web-cookie', notes: 'ZenMux uses website login on zenmux.ai. Create the provider, log in on zenmux.ai, then import the session with the Chrome extension. For API-key mode, add https://zenmux.ai/api/v1 as OpenAI-compatible.' },
 ] as ProviderPreset[]).map((preset): ProviderPreset => ({
   ...preset,
   flow: (preset.flow ?? (preset.oauth ? 'oauth' : 'api-key')) as ProviderPreset['flow'],

@@ -44,6 +44,7 @@ function inferType(baseUrl: string): string {
   if (u.includes('bud.app'))            return 'bud-web';
   if (u.includes('app.devin.ai'))       return 'devin-web';
   if (u.includes('perplexity.ai') && !u.includes('api.perplexity.ai')) return 'perplexity-web';
+  if (u.includes('zenmux.ai') && !u.includes('/api/')) return 'zenmux-web';
   if (u.includes('cloudcode-pa.googleapis.com')) return 'gemini-cli';
   if (u.includes('daily-cloudcode-pa.googleapis.com')) return 'antigravity';
   if (u.includes('backend-api/codex')) return 'codex';

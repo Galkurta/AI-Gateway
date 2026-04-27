@@ -16,6 +16,12 @@ const CAPABILITY_BADGES: Record<ModelCapability, string> = {
   unknown: 'badge-gray',
 };
 
+const BILLING_BADGES: Record<NonNullable<ModelInfo['billing']>, string> = {
+  free: 'badge-green',
+  premium: 'badge-yellow',
+  unknown: 'badge-gray',
+};
+
 export default function ModelsPage() {
   const [models, setModels]       = useState<ModelInfo[]>([]);
   const [fetchErrors, setFetchErrors] = useState<FetchError[]>([]);
@@ -364,6 +370,7 @@ export default function ModelsPage() {
 	                const existingAlias = findAlias(m);
 	                const upstream = upstreamModel(m);
 	                const capability = capabilityOf(m);
+                  const billing = m.billing ?? 'unknown';
                   const testKey = `${m.provider_id}:${m.id}`;
                   const inlineResult = testResultsByKey[testKey];
 	                return (
@@ -376,6 +383,7 @@ export default function ModelsPage() {
                         )}
                       </div>
 	                      <span className={`${CAPABILITY_BADGES[capability]} flex-shrink-0`}>{capability}</span>
+                        {m.billing && <span className={`${BILLING_BADGES[billing]} flex-shrink-0`}>{billing === 'premium' ? 'Premium' : billing === 'free' ? 'Free' : 'Unknown'}</span>}
 	                      {m.owned_by && <span className="text-xs text-muted flex-shrink-0">{m.owned_by}</span>}
                       <button
                         className="btn-ghost p-1 flex-shrink-0"
@@ -424,6 +432,15 @@ export default function ModelsPage() {
                     )}
                     {editing && (
                       <p className="text-[11px] text-muted font-mono truncate">maps to {upstream}</p>
+                    )}
+                    {(m.pricing_summary || m.context_length || m.features?.length || m.input_modalities?.length || m.output_modalities?.length) && (
+                      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted">
+                        {m.pricing_summary && <span className="font-mono">{m.pricing_summary}</span>}
+                        {m.context_length && <span className="font-mono">ctx {m.context_length.toLocaleString()}</span>}
+                        {m.features?.map(feature => <span key={feature} className="badge-gray">{feature}</span>)}
+                        {m.input_modalities?.length && <span className="font-mono">in: {m.input_modalities.join(',')}</span>}
+                        {m.output_modalities?.length && <span className="font-mono">out: {m.output_modalities.join(',')}</span>}
+                      </div>
                     )}
                     {inlineResult && renderTestResult(inlineResult)}
                   </div>

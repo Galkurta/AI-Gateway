@@ -2,7 +2,7 @@
  * AI Gateway - Background Service Worker
  * Dynamic: works with ANY provider configured in the gateway.
  */
-const WEB_COOKIE_TYPES = new Set(['claude-web', 'chatgpt-web', 'bud-web', 'devin-web', 'perplexity-web']);
+const WEB_COOKIE_TYPES = new Set(['claude-web', 'chatgpt-web', 'bud-web', 'devin-web', 'perplexity-web', 'zenmux-web']);
 
 /** Extract ALL cookies from a given URL/domain */
 async function extractCookiesFromUrl(url) {
@@ -147,6 +147,28 @@ async function extractDevinAuthFromTab(tabId, tabUrl) {
             out.__devin_token_source = source;
           }
         };
+        const rememberOAuthTokens = value => {
+          if (!value || typeof value !== 'object') return;
+          const body = value.body && typeof value.body === 'object' ? value.body : value;
+          if (typeof body.access_token === 'string') {
+            rememberAccessToken(body.access_token, 'auth0-localstorage');
+            out.access_token = body.access_token;
+            out.oauth_access_token = body.access_token;
+          }
+          if (typeof body.refresh_token === 'string') out.refresh_token = body.refresh_token;
+          if (body.expires_in && !out.access_token_expires_at) {
+            const seconds = Number(body.expires_in);
+            if (Number.isFinite(seconds)) out.access_token_expires_at = String(Date.now() + seconds * 1000);
+          }
+          if (typeof value.expiresAt === 'number' && !out.access_token_expires_at) {
+            out.access_token_expires_at = String(value.expiresAt * 1000);
+          }
+          if (out.refresh_token || out.access_token) {
+            out.oauth_provider = 'devin';
+            out.devin_auth0_domain = 'auth.devin.ai';
+            out.devin_auth0_client_id = 'DjKr4B4qtVDBVMBzE4FvveclTSkJYfhk';
+          }
+        };
         const rememberToken = value => {
           if (looksJwt(value)) rememberAccessToken(value);
         };
@@ -156,6 +178,7 @@ async function extractDevinAuthFromTab(tabId, tabUrl) {
           if (mode === 'auth1') rememberDevinToken(value);
           try {
             const parsed = JSON.parse(value);
+            rememberOAuthTokens(parsed);
             const walk = node => {
               if (!node) return;
               if (typeof node === 'string') {
@@ -205,6 +228,7 @@ async function extractDevinAuthFromTab(tabId, tabUrl) {
               const lower = key.toLowerCase();
               if (lower.includes('auth') || lower.includes('token') || lower.includes('session') || lower.includes('devin')) {
                 out[`storage_${key}`] = value;
+                scanValue(value, 'none');
                 if (key === 'auth1_session') {
                   try {
                     const parsed = JSON.parse(value);
@@ -218,6 +242,84 @@ async function extractDevinAuthFromTab(tabId, tabUrl) {
           } catch {}
         }
 
+        return out;
+      },
+    });
+    return injection?.result && typeof injection.result === 'object' ? injection.result : {};
+  } catch {
+    return {};
+  }
+}
+
+async function extractZenMuxAuthFromTab(tabId, tabUrl) {
+  if (!tabId) return {};
+  try {
+    const host = new URL(tabUrl).hostname;
+    if (host !== 'zenmux.ai' && !host.endsWith('.zenmux.ai')) return {};
+  } catch {
+    return {};
+  }
+
+  try {
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: () => {
+        const out = {};
+        try {
+          const directCookies = Object.fromEntries(document.cookie.split(';').map(part => {
+            const index = part.indexOf('=');
+            if (index < 0) return ['', ''];
+            return [part.slice(0, index).trim(), part.slice(index + 1)];
+          }).filter(([key]) => key));
+          if (directCookies.ctoken) {
+            out.zenmux_ctoken = directCookies.ctoken;
+            out.zenmux_csrf_token = directCookies.ctoken;
+          }
+        } catch {}
+        const looksBearer = value =>
+          typeof value === 'string' &&
+          (value.startsWith('sk-') || value.startsWith('sk_') || /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value));
+        const rememberToken = value => {
+          if (looksBearer(value) && !out.__zenmux_bearer) out.__zenmux_bearer = value;
+        };
+        const scan = value => {
+          if (typeof value === 'string') {
+            rememberToken(value);
+            try { scan(JSON.parse(value)); } catch {}
+            return;
+          }
+          if (Array.isArray(value)) {
+            value.forEach(scan);
+            return;
+          }
+          if (value && typeof value === 'object') {
+            for (const [key, nested] of Object.entries(value)) {
+              const lower = key.toLowerCase();
+              if (lower.includes('token') || lower.includes('apikey') || lower.includes('api_key') || lower.includes('authorization')) {
+                rememberToken(nested);
+                if (typeof nested === 'string' && !out[`zenmux_${lower}`]) out[`zenmux_${lower}`] = nested;
+              }
+              scan(nested);
+            }
+          }
+        };
+
+        for (const storage of [window.localStorage, window.sessionStorage]) {
+          try {
+            for (let i = 0; i < storage.length; i += 1) {
+              const key = storage.key(i);
+              if (!key) continue;
+              const value = storage.getItem(key);
+              if (!value) continue;
+              const lower = key.toLowerCase();
+              if (lower.includes('zenmux') || lower.includes('auth') || lower.includes('token') || lower.includes('api')) {
+                out[`storage_${key}`] = value;
+                scan(value);
+              }
+            }
+          } catch {}
+        }
         return out;
       },
     });
@@ -424,7 +526,8 @@ async function extractAndPush(providerId, tabUrl, tabId, account = {}) {
     };
     const budAuth = await extractBudAuthFromTab(target.tabId, target.tabUrl);
     const devinAuth = await extractDevinAuthFromTab(target.tabId, target.tabUrl);
-    return pushCookiesToGateway(providerId, { ...cookies, ...budAuth, ...devinAuth }, account);
+    const zenmuxAuth = await extractZenMuxAuthFromTab(target.tabId, target.tabUrl);
+    return pushCookiesToGateway(providerId, { ...cookies, ...budAuth, ...devinAuth, ...zenmuxAuth }, account);
   } finally {
     await closeTemporaryBudTab(target);
     await closeTemporaryDevinTab(target);
@@ -449,11 +552,17 @@ async function handleTabUpdate(tabId, changeInfo, tab) {
     try {
       const providerUrl = new URL(p.base_url);
       if (providerUrl.hostname !== tabUrl.hostname) continue;
+      if (p.type === 'zenmux-web') {
+        await new Promise(resolve => setTimeout(resolve, 2500));
+      }
       const result = await extractAndPush(p.id, tab.url, tabId);
       if (result.success) {
         chrome.action.setBadgeText({ text: '✓', tabId });
         chrome.action.setBadgeBackgroundColor({ color: '#3fb950', tabId });
         setTimeout(() => chrome.action.setBadgeText({ text: '', tabId }).catch(() => {}), 3000);
+        if (p.type === 'zenmux-web') {
+          setTimeout(() => extractAndPush(p.id, tab.url, tabId).catch(() => {}), 4000);
+        }
       }
     } catch { /* skip */ }
   }
