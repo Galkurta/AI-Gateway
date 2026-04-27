@@ -14,6 +14,7 @@ const TYPE_META: Record<string, { label: string; color: string }> = {
   'chatgpt-web':         { label: 'ChatGPT Web',      color: 'badge-yellow' },
   'bud-web':             { label: 'Bud Web',          color: 'badge-yellow' },
   'devin-web':           { label: 'Devin Web',        color: 'badge-yellow' },
+  'perplexity-web':      { label: 'Perplexity Web',   color: 'badge-yellow' },
   'zenmux-web':          { label: 'ZenMux Web',       color: 'badge-yellow' },
   'gemini-cli':          { label: 'Gemini CLI',       color: 'badge-blue'   },
   'antigravity':         { label: 'Antigravity',      color: 'badge-blue'   },
