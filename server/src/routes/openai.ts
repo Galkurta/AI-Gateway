@@ -163,6 +163,11 @@ openaiRouter.post('/chat/completions', async (req: Request, res: Response) => {
     max_tokens?: number;
     top_p?: number;
     stop?: string | string[];
+    metadata?: unknown;
+    user?: string;
+    conversation_id?: string;
+    thread_id?: string;
+    chat_id?: string;
   };
 
   const { model, messages, stream = false } = body;
@@ -187,6 +192,11 @@ openaiRouter.post('/chat/completions', async (req: Request, res: Response) => {
     max_tokens: body.max_tokens,
     top_p: body.top_p,
     stop: body.stop,
+    metadata: body.metadata,
+    user: body.user,
+    conversation_id: body.conversation_id,
+    thread_id: body.thread_id,
+    chat_id: body.chat_id,
   };
   const tokenSaverStats = compressNormalizedRequest(normalizedReq);
   const tokenSaverLog = formatTokenSaverLog(tokenSaverStats);

@@ -1,4 +1,5 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { db } from '../../db/index.js';
 import type {
   ModelInfo,
   NormalizedRequest,
@@ -161,9 +162,15 @@ function contentToText(content: NormalizedRequest['messages'][number]['content']
     .join('\n');
 }
 
+function userMessages(req: NormalizedRequest): string[] {
+  return req.messages
+    .filter(m => m.role === 'user')
+    .map(m => contentToText(m.content).trim())
+    .filter(Boolean);
+}
+
 function promptFromRequest(req: NormalizedRequest): string {
-  const user = [...req.messages].reverse().find(m => m.role === 'user');
-  const prompt = user ? contentToText(user.content).trim() : '';
+  const prompt = userMessages(req).at(-1) ?? '';
   if (!prompt) throw new Error('Devin Web requires at least one user text message.');
   return prompt;
 }
@@ -192,6 +199,79 @@ async function readJson(res: Response): Promise<unknown> {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function stringFromUnknown(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function metadata(req: NormalizedRequest): Record<string, unknown> {
+  return isObject(req.metadata) ? req.metadata : {};
+}
+
+function explicitSessionId(req: NormalizedRequest): string | undefined {
+  const meta = metadata(req);
+  return stringFromUnknown(req.devin_session_id)
+    ?? stringFromUnknown(meta.devin_session_id)
+    ?? stringFromUnknown(meta.devinSessionId)
+    ?? stringFromUnknown(meta.session_id)
+    ?? stringFromUnknown(meta.sessionId);
+}
+
+function conversationKey(req: NormalizedRequest): string {
+  const meta = metadata(req);
+  const explicit = stringFromUnknown(req.conversation_id)
+    ?? stringFromUnknown(req.thread_id)
+    ?? stringFromUnknown(req.chat_id)
+    ?? stringFromUnknown(meta.conversation_id)
+    ?? stringFromUnknown(meta.conversationId)
+    ?? stringFromUnknown(meta.thread_id)
+    ?? stringFromUnknown(meta.threadId)
+    ?? stringFromUnknown(meta.chat_id)
+    ?? stringFromUnknown(meta.chatId);
+  const firstUser = userMessages(req)[0] ?? requestText(req);
+  const seed = explicit ? `explicit:${explicit}` : `first-user:${firstUser}`;
+  return createHash('sha256').update(`${req.model}\n${seed}`).digest('hex').slice(0, 32);
+}
+
+function sessionMap(config: ProviderConfig): Record<string, string> {
+  const raw = config.cookies?.devin_session_map;
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isObject(parsed)) return {};
+    const out: Record<string, string> = {};
+    for (const [key, value] of Object.entries(parsed)) {
+      if (typeof value === 'string' && value.startsWith('devin-')) out[key] = value;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function savedSessionId(config: ProviderConfig, req: NormalizedRequest): string | undefined {
+  return explicitSessionId(req) ?? sessionMap(config)[conversationKey(req)];
+}
+
+function saveSessionId(config: ProviderConfig, req: NormalizedRequest, devinId: string): void {
+  const map = sessionMap(config);
+  map[conversationKey(req)] = devinId;
+  const entries = Object.entries(map).slice(-100);
+  const cookies = {
+    ...(config.cookies ?? {}),
+    devin_session_map: JSON.stringify(Object.fromEntries(entries)),
+    devin_last_session_id: devinId,
+  };
+  config.cookies = cookies;
+  const now = Date.now();
+  if (config.accountId) {
+    db.prepare('UPDATE provider_accounts SET cookies = ?, updated_at = ? WHERE id = ?')
+      .run(JSON.stringify(cookies), now, config.accountId);
+  } else {
+    db.prepare('UPDATE providers SET cookies = ?, updated_at = ? WHERE id = ?')
+      .run(JSON.stringify(cookies), now, config.id);
+  }
 }
 
 async function createSession(config: ProviderConfig, req: NormalizedRequest): Promise<string> {
@@ -253,6 +333,53 @@ async function createSession(config: ProviderConfig, req: NormalizedRequest): Pr
   if (!res.ok) throw new Error(`Devin session create failed ${res.status}: ${JSON.stringify(json)}`);
   if (isObject(json) && typeof json.devin_id === 'string') return json.devin_id;
   return devinId;
+}
+
+async function sendMessageToSession(config: ProviderConfig, devinId: string, req: NormalizedRequest): Promise<boolean> {
+  const prompt = promptFromRequest(req);
+  const context = storedContext(config);
+  const userId = context.userId ?? setting(config, 'UserId');
+  const orgId = context.orgId ?? setting(config, 'OrgId');
+
+  if (userId && orgId) {
+    let res = await fetch(`${baseUrl(config)}/api/resume-devin`, {
+      method: 'POST',
+      headers: headers(config),
+      body: JSON.stringify({
+        user_id: userId,
+        org_id: orgId,
+        devin_id: devinId,
+        reason: prompt,
+      }),
+    });
+    if (res.status === 401 && await refreshOAuthToken(config, true).catch(() => false)) {
+      res = await fetch(`${baseUrl(config)}/api/resume-devin`, {
+        method: 'POST',
+        headers: headers(config),
+        body: JSON.stringify({
+          user_id: userId,
+          org_id: orgId,
+          devin_id: devinId,
+          reason: prompt,
+        }),
+      });
+    }
+    if (res.ok) return true;
+  }
+
+  const attempts = [
+    `${baseUrl(config)}/api/sessions/${encodeURIComponent(devinId)}/message`,
+    `${baseUrl(config)}/api/session/${encodeURIComponent(devinId)}/message`,
+  ];
+  for (const url of attempts) {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: headers(config),
+      body: JSON.stringify({ message: prompt }),
+    });
+    if (res.ok) return true;
+  }
+  return false;
 }
 
 async function resolveOrgId(config: ProviderConfig, devinId: string): Promise<string> {
@@ -338,7 +465,19 @@ async function runDevin(config: ProviderConfig, req: NormalizedRequest): Promise
     throw new Error('Devin Web requires cookies or a bearer token from a logged-in app.devin.ai session.');
   }
   const startedAt = Date.now();
-  const devinId = await createSession(config, req);
+  const existingDevinId = savedSessionId(config, req);
+  const shouldResume = !!existingDevinId && userMessages(req).length > 1;
+  let devinId = existingDevinId ?? '';
+  if (shouldResume) {
+    const sent = await sendMessageToSession(config, existingDevinId, req);
+    if (!sent) {
+      devinId = await createSession(config, req);
+      saveSessionId(config, req, devinId);
+    }
+  } else {
+    devinId = await createSession(config, req);
+    saveSessionId(config, req, devinId);
+  }
   const orgId = await resolveOrgId(config, devinId);
   const content = await waitForMessage(config, orgId, devinId, startedAt);
   return { content, devinId };
