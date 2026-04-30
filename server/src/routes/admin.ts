@@ -58,6 +58,12 @@ function inferType(baseUrl: string): string {
   return 'openai-compatible';
 }
 
+function normalizeTestContent(content: string): string {
+  const trimmed = content.trim();
+  if (/^(?:ok[\s.!]*)+$/i.test(trimmed)) return 'OK';
+  return trimmed;
+}
+
 // ─── Stats / Dashboard ────────────────────────────────────────────────────────
 
 adminRouter.get('/stats', (_req, res) => {
@@ -619,13 +625,17 @@ adminRouter.post('/models/test', async (req, res) => {
       return;
     }
 
+    const chatPrompt = (typeof prompt === 'string' && prompt.trim())
+      ? prompt.trim()
+      : 'Reply with exactly one word: OK';
     const requestBody: NormalizedRequest = {
       model: resolvedModel,
-      messages: [{ role: 'user', content: prompt || 'Reply with a short OK if this model is working.' }],
-      max_tokens: 128,
-      temperature: 0.2,
+      messages: [{ role: 'user', content: chatPrompt }],
+      max_tokens: 8,
+      temperature: 0,
     };
     const result = await adapter.complete(config, requestBody);
+    const content = normalizeTestContent(result.content);
     const responseBody = {
       ok: true,
       model,
@@ -633,7 +643,7 @@ adminRouter.post('/models/test', async (req, res) => {
       capability,
       provider: { id: config.id, name: config.name, type: config.type },
       latency: Date.now() - startedAt,
-      content: result.content,
+      content,
       usage: {
         input_tokens: result.input_tokens,
         output_tokens: result.output_tokens,
@@ -650,7 +660,7 @@ adminRouter.post('/models/test', async (req, res) => {
       status: 200,
       latency: Date.now() - startedAt,
       req_body: requestBody,
-      res_body: { content: result.content.slice(0, 500) },
+      res_body: { content: content.slice(0, 500) },
     });
     res.json(responseBody);
   } catch (err) {

@@ -48,6 +48,7 @@ const DEFAULT_BASE_URLS: Partial<Record<ProviderType, string>> = {
 
 function effectiveProviderType(p: Pick<Provider, 'type' | 'base_url'>): ProviderType {
   const base = p.base_url?.toLowerCase() ?? '';
+  if (base.includes('backend-api/codex')) return 'codex';
   if (base.includes('app.devin.ai')) return 'devin-web';
   if (base.includes('bud.app')) return 'bud-web';
   if (base.includes('perplexity.ai') && !base.includes('api.perplexity.ai')) return 'perplexity-web';

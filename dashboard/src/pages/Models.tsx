@@ -32,7 +32,7 @@ export default function ModelsPage() {
   const [newPattern, setNewPattern]   = useState('');
   const [newProvider, setNewProvider] = useState('');
   const [newOverride, setNewOverride] = useState('');
-  const [testPrompt, setTestPrompt] = useState('Reply with a short OK if this model is working.');
+  const [testPrompt, setTestPrompt] = useState('Reply with exactly one word: OK');
   const [testingModel, setTestingModel] = useState('');
   const [testingProvider, setTestingProvider] = useState('');
   const [testResultsByKey, setTestResultsByKey] = useState<Record<string, ModelTestResult>>({});
@@ -175,7 +175,7 @@ export default function ModelsPage() {
 
   function renderTestResult(result: ModelTestResult) {
     const detail = result.ok ? result.content : result.error;
-    const showDetail = !!detail && (!result.ok || !/^ok[.!]?$/i.test(detail.trim()));
+    const showDetail = !!detail && (!result.ok || !/^(?:ok[\s.!]*)+$/i.test(detail.trim()));
     return (
       <div className={`border rounded px-3 py-2 ${result.ok ? 'bg-success/10 border-success/20' : 'bg-danger/10 border-danger/20'}`}>
         <div className="flex items-start gap-2">

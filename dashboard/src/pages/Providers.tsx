@@ -41,6 +41,7 @@ function detectType(url: string): string {
   if (u.includes('app.devin.ai'))      return 'devin-web';
   if (u.includes('perplexity.ai') && !u.includes('api.perplexity.ai')) return 'perplexity-web';
   if (u.includes('zenmux.ai') && !u.includes('/api/')) return 'zenmux-web';
+  if (u.includes('backend-api/codex')) return 'codex';
   if (u.includes('claude.ai'))         return 'claude-web';
   if (u.includes('chatgpt.com') || u.includes('chat.openai.com')) return 'chatgpt-web';
   if (u.includes('api.openai.com'))    return 'openai';
