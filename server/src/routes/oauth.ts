@@ -70,41 +70,10 @@ function localCallbackUri(req: { get(name: string): string | undefined }): strin
   return `http://localhost:${port}/callback`;
 }
 
-function localAppPort(req: { get(name: string): string | undefined }): number {
-  const host = req.get('host') ?? `localhost:${process.env.PORT ?? '3000'}`;
-  const parsed = Number.parseInt(host.includes(':') ? host.split(':').pop() ?? '' : process.env.PORT ?? '3000', 10);
-  return Number.isFinite(parsed) ? parsed : 3000;
+function codexIssuer(): string {
+  return new URL(CODEX_AUTHORIZE_URL).origin;
 }
 
-function stopCodexProxy(): void {
-  if (codexProxyTimer) clearTimeout(codexProxyTimer);
-  codexProxyTimer = null;
-  if (codexProxyServer) codexProxyServer.close();
-  codexProxyServer = null;
-}
-
-async function startCodexProxy(appPort: number): Promise<void> {
-  if (codexProxyServer) return;
-  await new Promise<void>((resolve, reject) => {
-    const server = http.createServer((req, res) => {
-      const url = new URL(req.url ?? '/', 'http://localhost:1455');
-      if (url.pathname === '/callback' || url.pathname === '/auth/callback') {
-        res.writeHead(302, { Location: `http://localhost:${appPort}/callback${url.search}` });
-        res.end();
-        stopCodexProxy();
-        return;
-      }
-      res.writeHead(404);
-      res.end('Not found');
-    });
-    server.once('error', reject);
-    server.listen(1455, '127.0.0.1', () => {
-      codexProxyServer = server;
-      codexProxyTimer = setTimeout(() => stopCodexProxy(), 300000);
-      resolve();
-    });
-  });
-}
 
 function buildIflowAuthUrl(redirectUri: string, state: string): string {
   const params = new URLSearchParams({
@@ -937,6 +906,7 @@ type DeviceStart = {
 
 async function startDeviceFlow(provider: OAuthProvider): Promise<DeviceStart> {
   if (provider === 'qwen') return startQwenDeviceFlow();
+  if (provider === 'codex') return startCodexDeviceFlow();
 
   if (provider === 'github') {
     const res = await fetch('https://github.com/login/device/code', {
@@ -1064,6 +1034,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
+async function startCodexDeviceFlow(): Promise<DeviceStart> {
+  const res = await fetch(`${codexIssuer()}/api/accounts/deviceauth/usercode`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ client_id: CODEX_CLIENT_ID }),
+  });
+  const json = await readJson(res);
+  if (!res.ok || typeof json.device_auth_id !== 'string' || typeof json.user_code !== 'string') {
+    throw new Error(`Codex device-code request failed ${res.status}: ${JSON.stringify(json)}`);
+  }
+  return {
+    deviceCode: json.device_auth_id,
+    userCode: json.user_code,
+    verificationUri: `${codexIssuer()}/codex/device`,
+    authUrl: `${codexIssuer()}/codex/device`,
+    intervalMs: typeof json.interval === 'number' ? Math.max(3, json.interval) * 1000 : 5000,
+  };
+}
+
 async function startQwenDeviceFlow(): Promise<{
   deviceCode: string;
   userCode?: string;
@@ -1141,8 +1130,52 @@ async function pollQwenToken(session: Extract<OAuthStatus, { status: 'pending' }
   throw new Error(`Qwen token polling failed ${res.status}: ${JSON.stringify(json)}`);
 }
 
+async function pollCodexDeviceToken(session: Extract<OAuthStatus, { status: 'pending' }>): Promise<OAuthStatus> {
+  if (!session.deviceCode || !session.userCode) throw new Error('Codex OAuth session is missing device_auth_id or user_code.');
+  if (Date.now() - (session.lastPollAt ?? 0) < (session.intervalMs ?? 5000)) return session;
+  session.lastPollAt = Date.now();
+
+  const res = await fetch(`${codexIssuer()}/api/accounts/deviceauth/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ device_auth_id: session.deviceCode, user_code: session.userCode }),
+  });
+  const json = await readJson(res);
+  if (res.status === 403 || res.status === 404) return session;
+  if (!res.ok) {
+    const err = typeof json.error === 'string' ? json.error : '';
+    if (err === 'authorization_pending') return session;
+    if (err === 'slow_down') {
+      session.intervalMs = (session.intervalMs ?? 5000) + 5000;
+      return session;
+    }
+    throw new Error(`Codex device auth polling failed ${res.status}: ${JSON.stringify(json)}`);
+  }
+
+  const code = typeof json.authorization_code === 'string' ? json.authorization_code : '';
+  const codeVerifier = typeof json.code_verifier === 'string' ? json.code_verifier : '';
+  if (!code || !codeVerifier) throw new Error(`Codex device auth response missing authorization_code or code_verifier: ${JSON.stringify(json)}`);
+
+  const tokens = await exchangeCodexCode(code, `${codexIssuer()}/deviceauth/callback`, codeVerifier);
+  const account = tokens.email ?? `codex-${String(tokens.refreshToken ?? tokens.accessToken).slice(0, 12)}`;
+  const providerId = upsertBearerProvider({
+    targetProviderId: session.targetProviderId,
+    provider: 'codex',
+    type: 'codex',
+    baseUrl: 'https://chatgpt.com/backend-api/codex/responses',
+    accessToken: tokens.accessToken,
+    refreshToken: tokens.refreshToken,
+    expiresIn: tokens.expiresIn,
+    email: account,
+    notes: `Connected via Codex device-code OAuth (${account})`,
+    cookies: { id_token: tokens.idToken, expires_in: tokens.expiresIn },
+  });
+  return { status: 'complete', provider: 'codex', createdAt: session.createdAt, providerId, email: account };
+}
+
 async function pollGenericDeviceProvider(session: Extract<OAuthStatus, { status: 'pending' }>): Promise<OAuthStatus> {
   if (session.provider === 'qwen') return pollQwenToken(session);
+  if (session.provider === 'codex') return pollCodexDeviceToken(session);
   if (!session.deviceCode) throw new Error(`${session.provider} OAuth session is missing device_code.`);
   if (Date.now() - (session.lastPollAt ?? 0) < (session.intervalMs ?? 5000)) return session;
   session.lastPollAt = Date.now();
@@ -1522,12 +1555,20 @@ oauthAdminRouter.post('/:provider/start', async (req, res) => {
     }
 
     if (provider === 'codex') {
-      const { verifier, challenge } = pkcePair();
-      await startCodexProxy(localAppPort(req));
-      const redirectUri = 'http://localhost:1455/auth/callback';
-      const authUrl = buildCodexAuthUrl(redirectUri, state, challenge);
-      oauthSessions.set(state, { status: 'pending', provider, createdAt: Date.now(), targetProviderId, codeVerifier: verifier, intervalMs: 5000, lastPollAt: 0, authUrl, redirectUri });
-      res.json({ state, authUrl });
+      const device = await startCodexDeviceFlow();
+      oauthSessions.set(state, {
+        status: 'pending',
+        provider,
+        createdAt: Date.now(),
+        targetProviderId,
+        deviceCode: device.deviceCode,
+        intervalMs: device.intervalMs,
+        lastPollAt: 0,
+        userCode: device.userCode,
+        verificationUri: device.verificationUri,
+        authUrl: device.authUrl,
+      });
+      res.json({ state, authUrl: device.authUrl, userCode: device.userCode, verificationUri: device.verificationUri });
       return;
     }
 
@@ -1604,7 +1645,7 @@ oauthAdminRouter.get('/:provider/status/:state', async (req, res) => {
     res.json(safe);
     return;
   }
-  if (provider === 'claude' || provider === 'cline' || provider === 'gemini-cli' || provider === 'antigravity' || provider === 'codex' || provider === 'gitlab') {
+  if (provider === 'claude' || provider === 'cline' || provider === 'gemini-cli' || provider === 'antigravity' || provider === 'gitlab') {
     const { codeVerifier: _codeVerifier, ...safe } = status;
     res.json(safe);
     return;
